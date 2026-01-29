@@ -1,9 +1,12 @@
-import requests
+## TEST THIS RAHHHH
+
 import json
 import os
 import time
 from pathlib import Path
+
 import polars as pl
+import requests
 
 
 PARQUET_PATH = Path("parquet/markets.parquet")
@@ -13,22 +16,36 @@ PROGRESS_PATH = Path("parquet/.markets_progress.json")
 def load_progress() -> int:
     """Load the current offset from progress file."""
     if PROGRESS_PATH.exists():
-        with open(PROGRESS_PATH, "r") as f:
-            return json.load(f).get("offset", 0)
+        try:
+            with open(PROGRESS_PATH, "r") as f:
+                return int(json.load(f).get("offset", 0))
+        except Exception:
+            # Corrupted/partial file -> start from 0 (or raise if you prefer)
+            return 0
     return 0
 
 
 def save_progress(offset: int):
-    """Save current offset to progress file."""
+    """Save current offset to progress file (atomic write)."""
     PROGRESS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(PROGRESS_PATH, "w") as f:
-        json.dump({"offset": offset}, f)
+    tmp = PROGRESS_PATH.with_suffix(PROGRESS_PATH.suffix + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump({"offset": int(offset)}, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, PROGRESS_PATH)  # atomic on POSIX
 
 
 def update_markets(batch_size: int = 500):
     """
     Fetch markets ordered by creation date and save to parquet.
     Automatically resumes from the correct offset.
+
+    NOTE:
+      - Progress file is NEVER deleted (per your request).
+      - Offset advances by len(markets) returned by the API (not the number parsed),
+        to avoid re-fetch overlap when you skip bad rows.
+      - Progress is saved every batch for reliable resumes.
     """
     base_url = "https://gamma-api.polymarket.com/markets"
 
@@ -43,7 +60,7 @@ def update_markets(batch_size: int = 500):
         print(f"Resuming from offset {current_offset}")
 
     total_fetched = 0
-    buffer = []
+    buffer: list[dict] = []
 
     while True:
         print(f"Fetching batch at offset {current_offset}...")
@@ -78,6 +95,13 @@ def update_markets(batch_size: int = 500):
                 print(f"No more markets found at offset {current_offset}. Completed!")
                 break
 
+            # IMPORTANT: advance offset by what the API returned,
+            # not by how many you successfully processed.
+            current_offset += len(markets)
+
+            # Save progress every batch so Ctrl+C / crash still leaves a good offset.
+            save_progress(current_offset)
+
             batch_count = 0
             for market in markets:
                 try:
@@ -100,8 +124,9 @@ def update_markets(batch_size: int = 500):
                     token2 = str(clob_tokens[1]) if len(clob_tokens) > 1 else ""
 
                     # Check for negative risk indicators
-                    neg_risk = market.get("negRiskAugmented", False) or market.get(
-                        "negRiskOther", False
+                    neg_risk = bool(
+                        market.get("negRiskAugmented", False)
+                        or market.get("negRiskOther", False)
                     )
 
                     # Create row with required columns
@@ -111,8 +136,9 @@ def update_markets(batch_size: int = 500):
 
                     # Get ticker from events if available
                     ticker = ""
-                    if market.get("events") and len(market.get("events", [])) > 0:
-                        ticker = market["events"][0].get("ticker", "")
+                    events = market.get("events") or []
+                    if events:
+                        ticker = events[0].get("ticker", "") or ""
 
                     buffer.append(
                         {
@@ -126,20 +152,20 @@ def update_markets(batch_size: int = 500):
                             "token1": token1,
                             "token2": token2,
                             "condition_id": market.get("conditionId", ""),
-                            "volume": market.get("volume", 0.0),
+                            "volume": float(market.get("volume", 0.0) or 0.0),
                             "ticker": ticker,
                             "closedTime": market.get("closedTime", "")
-                            or market.get("endDate", ""),
+                            or market.get("endDate", "")
+                            or "",
                         }
                     )
                     batch_count += 1
 
-                except (ValueError, KeyError, json.JSONDecodeError) as e:
+                except (ValueError, KeyError, json.JSONDecodeError, TypeError) as e:
                     print(f"Error processing market {market.get('id', 'unknown')}: {e}")
                     continue
 
             total_fetched += batch_count
-            current_offset += batch_count
 
             print(
                 f"Processed {batch_count} markets. Total new: {total_fetched}. Next offset: {current_offset}"
@@ -165,6 +191,10 @@ def update_markets(batch_size: int = 500):
             print("Retrying in 5 seconds...")
             time.sleep(5)
             continue
+        except KeyboardInterrupt:
+            print("\n🛑 Ctrl+C received. Saving progress and exiting...")
+            save_progress(current_offset)
+            break
         except Exception as e:
             print(f"Unexpected error: {e}")
             print("Retrying in 3 seconds...")
@@ -175,17 +205,15 @@ def update_markets(batch_size: int = 500):
     if buffer:
         print(f"💾 Final flush: {len(buffer)} records")
         _flush_buffer(buffer, existing_df)
+        buffer.clear()
 
     save_progress(current_offset)
-
-    # Cleanup progress file on completion
-    if PROGRESS_PATH.exists():
-        PROGRESS_PATH.unlink()
 
     final_count = len(pl.read_parquet(PARQUET_PATH)) if PARQUET_PATH.exists() else 0
     print(f"\n✅ Completed! Fetched {total_fetched} new markets.")
     print(f"Total records: {final_count}")
     print(f"Saved to: {PARQUET_PATH}")
+    print(f"Progress saved to: {PROGRESS_PATH} (not deleted)")
 
 
 def _flush_buffer(buffer: list, existing_df: pl.DataFrame | None):
@@ -218,3 +246,7 @@ def _flush_buffer(buffer: list, existing_df: pl.DataFrame | None):
 
     combined.write_parquet(PARQUET_PATH, compression="zstd")
     print(f"   ✓ Wrote {len(combined)} total records")
+
+
+if __name__ == "__main__":
+    update_markets()

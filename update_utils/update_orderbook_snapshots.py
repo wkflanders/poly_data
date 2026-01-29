@@ -1,20 +1,20 @@
 """
-Fetch historical orderbook snapshots from Polymarket CLOB API.
-
+Fetch historical orderbook snapshots from Polymarket CLOB API (async version).
 Usage:
-    uv run python -c "from update_utils.update_orderbook_snapshots import update_orderbook_snapshots; update_orderbook_snapshots()"
-    uv run python -c "from update_utils.update_orderbook_snapshots import update_orderbook_snapshots; update_orderbook_snapshots(workers=4)"
+    uv run python update_utils/update_orderbook_snapshots.py
 """
 
+import asyncio
+import aiohttp
 import json
-import time
+import os
+import random
 import signal
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 from datetime import datetime, timezone
 from pathlib import Path
+
 import polars as pl
-import requests
 
 # === Configuration ===
 BASE_URL = "https://clob.polymarket.com/orderbook-history"
@@ -25,59 +25,67 @@ OUTPUT_DIR = Path("parquet/orderbook_snapshots")
 PROGRESS_FILE = Path("parquet/orderbook_snapshots/.progress.json")
 
 SNAPSHOTS_PER_REQUEST = 1000
-FLUSH_EVERY = 20000  # Per-worker flush threshold
-REQUEST_DELAY = 0.01
-WORKERS = 4
+FLUSH_EVERY = 10000
+WORKERS = 70
+PROXIES_FILE = Path("proxies.json")
+SAVE_PROGRESS_EVERY = 100
 
-# Global for clean shutdown
+# Consolidation
+CONSOLIDATED_PARQUET = Path("parquet/orderbook_snapshots_consolidated.parquet")
+DELETE_SHARDS_AFTER_CONSOLIDATE = (
+    False  # set True if you want to remove shards after merging
+)
+
+
+def load_proxies() -> list[str]:
+    if PROXIES_FILE.exists():
+        with open(PROXIES_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+
+PROXIES = load_proxies()
+
+# Global state
 _shutdown = False
-_write_lock = threading.Lock()
-_progress_lock = threading.Lock()
-_print_lock = threading.Lock()
-
-# Thread-local sessions
-_tls = threading.local()
-
-
-def safe_print(msg: str):
-    with _print_lock:
-        print(msg)
-
-
-def _session() -> requests.Session:
-    s = getattr(_tls, "s", None)
-    if s is None:
-        s = requests.Session()
-        _tls.s = s
-    return s
-
-
-def _handle_signal(sig, frame):
-    global _shutdown
-    safe_print("\n⚠️  Shutdown requested, waiting for workers to finish...")
-    _shutdown = True
-
-
-signal.signal(signal.SIGINT, _handle_signal)
-signal.signal(signal.SIGTERM, _handle_signal)
+_total_snapshots = 0
+_total_assets = 0
+_completion_counter = 0
+_lock = asyncio.Lock()
 
 
 def load_progress() -> dict:
     if PROGRESS_FILE.exists():
-        with open(PROGRESS_FILE, "r") as f:
-            data = json.load(f)
-            if "in_progress" not in data:
-                data["in_progress"] = {}
-            if "completed_assets" not in data:
-                data["completed_assets"] = {}
-            return data
-    return {"completed_assets": {}, "in_progress": {}}
+        try:
+            with open(PROGRESS_FILE, "r") as f:
+                data = json.load(f)
+        except Exception:
+            # corrupted / partially-written progress file -> start fresh
+            return {"completed_assets": {}}
+
+        if "completed_assets" not in data:
+            data["completed_assets"] = {}
+        return data
+
+    return {"completed_assets": {}}
 
 
 def save_progress(progress: dict):
+    """
+    Atomic progress save:
+      1) write to temp
+      2) fsync
+      3) os.replace to final path (atomic on POSIX)
+    """
     PROGRESS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(PROGRESS_FILE, "w") as f:
+    tmp = PROGRESS_FILE.with_suffix(PROGRESS_FILE.suffix + ".tmp")
+
+    with open(tmp, "w") as f:
         json.dump(progress, f)
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.replace(tmp, PROGRESS_FILE)
 
 
 def get_asset_ids_from_markets() -> list[dict]:
@@ -85,7 +93,7 @@ def get_asset_ids_from_markets() -> list[dict]:
         raise FileNotFoundError(f"Markets file not found: {MARKETS_PARQUET}")
 
     df = pl.read_parquet(MARKETS_PARQUET)
-    safe_print(f"Loaded {len(df)} markets")
+    print(f"Loaded {len(df)} markets")
 
     assets = []
     for row in df.iter_rows(named=True):
@@ -93,18 +101,18 @@ def get_asset_ids_from_markets() -> list[dict]:
         created_at = row.get("createdAt", "")
         closed_time = row.get("closedTime", "")
 
-        for token_col in ["token1", "token2"]:
-            asset_id = row.get(token_col)
-            if asset_id and str(asset_id) != "0":
-                assets.append(
-                    {
-                        "asset_id": str(asset_id),
-                        "market_id": str(market_id),
-                        "created_at": created_at,
-                        "closed_time": closed_time,
-                    }
-                )
+        asset_id = row.get("token1")
+        if asset_id and str(asset_id) != "0":
+            assets.append(
+                {
+                    "asset_id": str(asset_id),
+                    "market_id": str(market_id),
+                    "created_at": created_at,
+                    "closed_time": closed_time,
+                }
+            )
 
+    # Dedup by asset_id
     seen = set()
     unique = []
     for a in assets:
@@ -132,7 +140,7 @@ def filter_assets_by_time(assets: list[dict], cutoff_ts_ms: int) -> list[dict]:
                     )
                 elif isinstance(created_at, datetime):
                     created_dt = created_at
-            except:
+            except Exception:
                 pass
 
         closed_dt = None
@@ -144,7 +152,7 @@ def filter_assets_by_time(assets: list[dict], cutoff_ts_ms: int) -> list[dict]:
                     )
                 elif isinstance(closed_time, datetime):
                     closed_dt = closed_time
-            except:
+            except Exception:
                 pass
 
         include = False
@@ -161,38 +169,39 @@ def filter_assets_by_time(assets: list[dict], cutoff_ts_ms: int) -> list[dict]:
     return filtered
 
 
-def fetch_orderbook_page(
-    asset_id: str, start_ts: int, timeout: int = 30, retries: int = 5
+async def fetch_orderbook_page(
+    session: aiohttp.ClientSession,
+    asset_id: str,
+    start_ts: int,
+    proxy: str | None = None,
+    retries: int = 5,
 ) -> tuple[int, list[dict]]:
     url = f"{BASE_URL}?asset_id={asset_id}&startTs={start_ts}&limit={SNAPSHOTS_PER_REQUEST}"
-    sess = _session()
 
     for attempt in range(retries):
-        try:
-            r = sess.get(url, timeout=timeout)
-
-            if r.status_code == 200:
-                data = r.json()
-                return data.get("count", 0), data.get("data", [])
-
-            if r.status_code in (429, 500, 502, 503, 504):
-                wait = 2**attempt
-                safe_print(f"    HTTP {r.status_code}, retrying in {wait}s...")
-                time.sleep(wait)
-                continue
-
-            if r.status_code == 400:
-                return 0, []
-
-            safe_print(f"    HTTP {r.status_code}: {r.text[:100]}")
+        if _shutdown:
             return 0, []
 
-        except requests.Timeout:
-            safe_print(f"    Timeout, attempt {attempt + 1}/{retries}")
-            time.sleep(2**attempt)
-        except requests.RequestException as e:
-            safe_print(f"    Request error: {e}")
-            time.sleep(2**attempt)
+        try:
+            async with session.get(
+                url, proxy=proxy, timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    return data.get("count", 0), data.get("data", [])
+
+                if r.status in (429, 500, 502, 503, 504):
+                    await asyncio.sleep(2**attempt)
+                    continue
+
+                if r.status == 400:
+                    return 0, []
+                return 0, []
+
+        except asyncio.TimeoutError:
+            await asyncio.sleep(2**attempt)
+        except aiohttp.ClientError:
+            await asyncio.sleep(2**attempt)
 
     return 0, []
 
@@ -221,7 +230,9 @@ def flatten_snapshot(snap: dict) -> dict:
         "num_ask_levels": len(asks),
         "best_bid": best_bid,
         "best_ask": best_ask,
-        "spread": (best_ask - best_bid) if (best_bid and best_ask) else None,
+        "spread": (best_ask - best_bid)
+        if (best_bid is not None and best_ask is not None)
+        else None,
         "total_bid_size": sum(float(b["size"]) for b in bids),
         "total_ask_size": sum(float(a["size"]) for a in asks),
         "min_order_size": snap.get("min_order_size", ""),
@@ -258,6 +269,7 @@ def write_buffer(buffer: list[dict]) -> int:
                 "neg_risk": pl.Boolean,
             },
         )
+
         total_written = 0
 
         for ym in df["year_month"].unique().to_list():
@@ -265,225 +277,284 @@ def write_buffer(buffer: list[dict]) -> int:
             partition_dir = OUTPUT_DIR / f"year_month={ym}"
             partition_dir.mkdir(parents=True, exist_ok=True)
 
-            ts = int(time.time() * 1000)
-            out_file = partition_dir / f"data_{ts}.parquet"
+            ts = int(time.time() * 1_000_000)
+            out_file = partition_dir / f"data_{id(buffer)}_{ts}.parquet"
 
             partition_df = partition_df.drop("year_month")
             partition_df.write_parquet(out_file, compression="zstd")
-
-            rows = len(partition_df)
-            size_kb = out_file.stat().st_size / 1024
-            safe_print(f"   ✓ Wrote {rows:,} rows to {ym} ({size_kb:.1f} KB)")
-            total_written += rows
+            total_written += len(partition_df)
 
         return total_written
 
     except Exception as e:
-        safe_print(f"   ❌ ERROR writing: {e}")
+        print(f"   ❌ ERROR writing: {e}")
         return 0
 
 
-def update_orderbook_snapshots(workers: int = WORKERS):
-    global _shutdown
+def _glob_shard_files() -> list[Path]:
+    if not OUTPUT_DIR.exists():
+        return []
+    return sorted(OUTPUT_DIR.glob("year_month=*/*.parquet"))
 
-    safe_print("=" * 60)
-    safe_print("📊 Polymarket Orderbook Snapshot Fetcher")
-    safe_print(f"   Workers: {workers}")
-    safe_print("=" * 60)
 
-    safe_print(f"\n📂 Loading markets from {MARKETS_PARQUET}")
-    assets = get_asset_ids_from_markets()
-    safe_print(f"   Found {len(assets)} unique asset IDs")
+def consolidate_orderbook_snapshots(
+    out_file: Path = CONSOLIDATED_PARQUET,
+    delete_shards: bool = DELETE_SHARDS_AFTER_CONSOLIDATE,
+) -> int:
+    """
+    Consolidate all shard parquet files into a single parquet file using Polars streaming.
+    Returns number of shard files consolidated (not rows).
+    """
+    shard_files = _glob_shard_files()
+    if not shard_files:
+        print("ℹ️  No shard parquet files found to consolidate.")
+        return 0
 
-    assets = filter_assets_by_time(assets, EARLIEST_SNAPSHOT_TS)
-    safe_print(f"   {len(assets)} assets after time filtering")
+    out_file.parent.mkdir(parents=True, exist_ok=True)
 
-    progress = load_progress()
-    completed = set(progress.get("completed_assets", {}).keys())
-    in_progress = progress.get("in_progress", {})
-    safe_print(f"   {len(completed)} completed, {len(in_progress)} in progress")
+    print(f"🧩 Consolidating {len(shard_files)} shard files → {out_file}")
+    lf = pl.scan_parquet([str(p) for p in shard_files])
+    lf.sink_parquet(str(out_file), compression="zstd")
 
-    todo = [a for a in assets if a["asset_id"] not in completed]
-    safe_print(f"   {len(todo)} assets to fetch")
-    import random
+    if delete_shards:
+        print("🧹 Deleting shard files...")
+        for p in shard_files:
+            try:
+                p.unlink()
+            except Exception as e:
+                print(f"   ⚠️  Could not delete {p}: {e}")
 
-    random.shuffle(todo)
-    if not todo:
-        safe_print("\n✅ All assets already fetched!")
-        return
+        for d in sorted(OUTPUT_DIR.glob("year_month=*"), reverse=True):
+            try:
+                if d.is_dir() and not any(d.iterdir()):
+                    d.rmdir()
+            except Exception:
+                pass
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    print("✅ Consolidation done.")
+    return len(shard_files)
 
-    total_snapshots = [0]  # Use list for mutable reference in threads
-    total_assets = [0]
-    start_time = time.time()
 
-    def process_asset(asset_info: dict) -> tuple[str, int]:
-        """Fetch all snapshots for one asset, flushing periodically."""
-        if _shutdown:
-            return asset_info["asset_id"], 0
+async def process_asset(
+    session: aiohttp.ClientSession,
+    asset_info: dict,
+    proxy: str | None,
+    progress: dict,
+) -> tuple[str, int]:
+    global _shutdown, _total_snapshots, _completion_counter
 
-        asset_id = asset_info["asset_id"]
-        buffer = []
+    if _shutdown:
+        return asset_info["asset_id"], 0
 
-        # Check if resuming
-        with _progress_lock:
-            if asset_id in progress.get("in_progress", {}):
-                current_ts = progress["in_progress"][asset_id]["last_ts"] + 1
-                fetched_so_far = progress["in_progress"][asset_id]["fetched"]
-                safe_print(f"\n🔄 Resuming {asset_id[:30]}... (from ts={current_ts})")
-            else:
-                current_ts = EARLIEST_SNAPSHOT_TS
-                fetched_so_far = 0
-                safe_print(f"\n🔍 Fetching {asset_id[:30]}...")
+    asset_id = asset_info["asset_id"]
+    buffer: list[dict] = []
+    current_ts = EARLIEST_SNAPSHOT_TS
+    fetched_so_far = 0
+    total_count = 0
+    pages = 0
 
-        total_count = 0
-        pages = 0
+    while not _shutdown:
+        count, snapshots = await fetch_orderbook_page(
+            session, asset_id, current_ts, proxy
+        )
 
-        while not _shutdown:
-            count, snapshots = fetch_orderbook_page(asset_id, current_ts)
-
-            if pages == 0:
-                total_count = count
-                if total_count == 0:
-                    safe_print(f"   - {asset_id[:30]}... no snapshots")
-                    return asset_id, 0
-
-            if not snapshots:
+        if pages == 0:
+            total_count = count
+            if total_count == 0:
                 break
 
-            pages += 1
+        if not snapshots:
+            break
 
-            for snap in snapshots:
-                buffer.append(flatten_snapshot(snap))
+        pages += 1
 
-            fetched_so_far += len(snapshots)
-            last_ts = max(int(s.get("timestamp", 0)) for s in snapshots)
-            last_dt = datetime.fromtimestamp(last_ts / 1000, tz=timezone.utc).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
+        for snap in snapshots:
+            buffer.append(flatten_snapshot(snap))
 
-            safe_print(
-                f"      [{asset_id[:15]}] Page {pages}: {len(snapshots)}, ts={last_ts} ({last_dt}), {fetched_so_far}/{total_count}"
-            )
+        fetched_so_far += len(snapshots)
+        last_ts = max(int(s.get("timestamp", 0)) for s in snapshots)
 
-            # Flush buffer if large enough
-            if len(buffer) >= FLUSH_EVERY:
-                with _write_lock:
-                    safe_print(
-                        f"\n💾 [{asset_id[:15]}] Flushing {len(buffer)} snapshots..."
-                    )
-                    written = write_buffer(buffer)
-                    total_snapshots[0] += written
-                buffer.clear()
+        if len(buffer) >= FLUSH_EVERY:
+            written = write_buffer(buffer)
+            async with _lock:
+                _total_snapshots += written
+            buffer.clear()
 
-                # Save progress mid-asset
-                with _progress_lock:
-                    progress["in_progress"][asset_id] = {
-                        "last_ts": last_ts,
-                        "fetched": fetched_so_far,
-                    }
-                    save_progress(progress)
+        if fetched_so_far >= total_count:
+            break
+        if last_ts <= current_ts:
+            break
+        current_ts = last_ts + 1
 
-            if fetched_so_far >= total_count:
-                break
+    if buffer:
+        written = write_buffer(buffer)
+        async with _lock:
+            _total_snapshots += written
 
-            if last_ts <= current_ts:
-                break
-            current_ts = last_ts + 1
-
-            time.sleep(REQUEST_DELAY)
-
-        # Flush remaining buffer
-        if buffer:
-            with _write_lock:
-                safe_print(
-                    f"\n💾 [{asset_id[:15]}] Flushing final {len(buffer)} snapshots..."
-                )
-                written = write_buffer(buffer)
-                total_snapshots[0] += written
-
-        if _shutdown:
-            with _progress_lock:
-                progress["in_progress"][asset_id] = {
-                    "last_ts": current_ts,
-                    "fetched": fetched_so_far,
-                }
-                save_progress(progress)
-            return asset_id, fetched_so_far
-
-        # Mark complete
-        with _progress_lock:
+    # Mark completed + occasional progress save (do NOT hold lock while writing file)
+    should_save = False
+    if not _shutdown:
+        async with _lock:
             progress["completed_assets"][asset_id] = {
                 "count": fetched_so_far,
                 "fetched_at": datetime.now(timezone.utc).isoformat(),
             }
-            if "in_progress" in progress and asset_id in progress["in_progress"]:
-                del progress["in_progress"][asset_id]
-            save_progress(progress)
+            _completion_counter += 1
+            should_save = _completion_counter % SAVE_PROGRESS_EVERY == 0
 
-        safe_print(f"   ✓ {asset_id[:30]}... -> {fetched_so_far} snapshots")
-        return asset_id, fetched_so_far
+    if should_save:
+        await asyncio.to_thread(save_progress, progress)
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(process_asset, a): a for a in todo}
+    return asset_id, fetched_so_far
 
-        for fut in as_completed(futures):
-            if _shutdown:
-                break
 
-            asset_info = futures[fut]
-            asset_id = asset_info["asset_id"]
+async def worker(
+    queue: asyncio.Queue,
+    session: aiohttp.ClientSession,
+    proxy: str | None,
+    progress: dict,
+    todo_count: int,
+    start_time: float,
+):
+    global _total_assets, _total_snapshots, _shutdown
 
-            try:
-                _, count = fut.result()
-                total_assets[0] += 1
+    while not _shutdown:
+        try:
+            asset_info = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
 
+        try:
+            await process_asset(session, asset_info, proxy, progress)
+        finally:
+            queue.task_done()
+
+        async with _lock:
+            _total_assets += 1
+            if _total_assets % 10 == 0:
                 elapsed = time.time() - start_time
-                rate = total_assets[0] / elapsed if elapsed > 0 else 0
-                safe_print(
-                    f"📈 Progress: {total_assets[0]}/{len(todo)} assets ({rate:.2f}/s), {total_snapshots[0]:,} written"
+                rate = _total_assets / elapsed if elapsed > 0 else 0
+                snap_rate = _total_snapshots / elapsed if elapsed > 0 else 0
+                print(
+                    f"📈 Progress: {_total_assets}/{todo_count} assets ({rate:.1f}/s), "
+                    f"{_total_snapshots:,} snapshots ({snap_rate:.0f}/s)"
                 )
 
-            except Exception as e:
-                safe_print(f"   ❌ [{asset_id[:15]}] Error: {e}")
 
-    # Always consolidate at end
-    consolidate_orderbook_snapshots()
+def _install_signal_handlers(
+    loop: asyncio.AbstractEventLoop, tasks: list[asyncio.Task]
+):
+    """
+    Best-effort signal handling: on SIGINT/SIGTERM set shutdown and cancel tasks.
+    (SIGKILL cannot be handled.)
+    """
 
-    elapsed = time.time() - start_time
-    safe_print(f"\n{'=' * 60}")
-    safe_print(f"✅ {'Stopped' if _shutdown else 'Complete'}!")
-    safe_print(f"   Assets processed: {total_assets[0]}")
-    safe_print(f"   Total snapshots written: {total_snapshots[0]:,}")
-    safe_print(f"   Time: {elapsed:.1f}s")
-    safe_print(f"{'=' * 60}")
+    def _request_shutdown(sig_name: str):
+        global _shutdown
+        if _shutdown:
+            return
+        _shutdown = True
+        print(f"\n🛑 Received {sig_name} → requesting shutdown...")
+        for t in tasks:
+            t.cancel()
+
+    for sig, name in ((signal.SIGINT, "SIGINT"), (signal.SIGTERM, "SIGTERM")):
+        try:
+            loop.add_signal_handler(sig, _request_shutdown, name)
+        except NotImplementedError:
+            # Windows / some event loops
+            try:
+                signal.signal(sig, lambda *_: _request_shutdown(name))
+            except Exception:
+                pass
 
 
-def consolidate_orderbook_snapshots():
-    import duckdb
+async def update_orderbook_snapshots(workers: int = WORKERS):
+    global _shutdown, _total_snapshots, _total_assets, _completion_counter
+    _shutdown = False
+    _total_snapshots = 0
+    _total_assets = 0
+    _completion_counter = 0
 
-    safe_print("🔧 Consolidating partition files...")
+    print("=" * 60)
+    print("📊 Polymarket Orderbook Snapshot Fetcher (ASYNC)")
+    print(f"   Workers: {workers}")
+    print(f"   Proxies: {len(PROXIES)}")
+    print("=" * 60)
 
-    for partition_dir in OUTPUT_DIR.glob("year_month=*"):
-        part_files = list(partition_dir.glob("*.parquet"))
-        if len(part_files) <= 1:
-            continue
+    print(f"\n📂 Loading markets from {MARKETS_PARQUET}")
+    assets = get_asset_ids_from_markets()
+    print(f"   Found {len(assets)} unique asset IDs")
 
-        safe_print(f"   {partition_dir.name}: {len(part_files)} files -> 1")
+    assets = filter_assets_by_time(assets, EARLIEST_SNAPSHOT_TS)
+    print(f"   {len(assets)} assets after time filtering")
 
-        out_file = partition_dir / "data_consolidated.parquet"
-        glob_pattern = str(partition_dir / "*.parquet")
+    progress = load_progress()
+    completed = set(progress.get("completed_assets", {}).keys())
+    print(f"   {len(completed)} already completed")
 
-        duckdb.sql(f"""
-            COPY (SELECT * FROM read_parquet('{glob_pattern}'))
-            TO '{out_file}' (FORMAT PARQUET, COMPRESSION ZSTD)
-        """)
+    todo = [a for a in assets if a["asset_id"] not in completed]
+    print(f"   {len(todo)} assets to fetch")
 
-        for f in part_files:
-            if f.name != "data_consolidated.parquet":
-                f.unlink()
+    random.shuffle(todo)
 
-        out_file.rename(partition_dir / "data.parquet")
+    if not todo:
+        print("\n✅ All assets already fetched!")
+        consolidate_orderbook_snapshots()
+        return
 
-    safe_print("✅ Consolidation complete")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    start_time = time.time()
+
+    queue: asyncio.Queue = asyncio.Queue()
+    for a in todo:
+        queue.put_nowait(a)
+
+    connector = aiohttp.TCPConnector(limit=0, limit_per_host=0)
+    tasks: list[asyncio.Task] = []
+    loop = asyncio.get_running_loop()
+
+    try:
+        async with aiohttp.ClientSession(connector=connector) as session:
+            for i in range(workers):
+                proxy = PROXIES[i % len(PROXIES)] if PROXIES else None
+                tasks.append(
+                    asyncio.create_task(
+                        worker(queue, session, proxy, progress, len(todo), start_time)
+                    )
+                )
+
+            _install_signal_handlers(loop, tasks)
+
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    except KeyboardInterrupt:
+        _shutdown = True
+        print("\n🛑 KeyboardInterrupt → requesting shutdown...")
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    finally:
+        # Always save progress and consolidate on exit / interrupt
+        try:
+            await asyncio.to_thread(save_progress, progress)
+        except Exception as e:
+            print(f"⚠️  Failed to save progress: {e}")
+
+        try:
+            consolidate_orderbook_snapshots()
+        except Exception as e:
+            print(f"⚠️  Consolidation failed: {e}")
+
+        elapsed = time.time() - start_time
+        print(f"\n{'=' * 60}")
+        print(f"✅ {'Stopped' if _shutdown else 'Complete'}!")
+        print(f"   Assets processed: {_total_assets}")
+        print(f"   Total snapshots written: {_total_snapshots:,}")
+        print(f"   Time: {elapsed:.1f}s")
+        print(f"{'=' * 60}")
+
+
+if __name__ == "__main__":
+    asyncio.run(update_orderbook_snapshots())
