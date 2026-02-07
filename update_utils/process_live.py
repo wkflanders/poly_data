@@ -1,41 +1,90 @@
 import warnings
+
 warnings.filterwarnings("ignore")
 
-import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import polars as pl
-from poly_utils.utils import get_markets
-
 import subprocess
+from pathlib import Path
+
 import pandas as pd
+import polars as pl
 
 
 ORDER_FILLED_PATH = "goldsky/orderFilled.csv"
 PROCESSED_PATH = "processed/trades.csv"
 
+# ✅ use parquet markets (same schema as your updater writes)
+MARKETS_PARQUET_PATH = "parquet/markets.parquet"
 
-def _build_markets_long() -> pl.DataFrame:
-    markets_df = get_markets().rename({"id": "market_id"})
-    return (
-        markets_df
-        .select(["market_id", "token1", "token2"])
-        .melt(
+
+def _build_markets_long(
+    markets_parquet_path: str = MARKETS_PARQUET_PATH,
+) -> pl.DataFrame:
+    """
+    Build long mapping:
+      asset_id -> (market_id, side)
+    from parquet/markets.parquet which has columns: id, token1, token2.
+    """
+    path = Path(markets_parquet_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Missing markets parquet: {path}")
+
+    markets_df = pl.read_parquet(path)
+
+    required = {"id", "token1", "token2"}
+    missing = required - set(markets_df.columns)
+    if missing:
+        raise ValueError(
+            f"{path} missing columns: {sorted(missing)} (have: {markets_df.columns})"
+        )
+
+    markets_df = (
+        markets_df.select(["id", "token1", "token2"])
+        .rename({"id": "market_id"})
+        .with_columns(
+            [
+                pl.col("market_id").cast(pl.Utf8),
+                pl.col("token1").cast(pl.Utf8),
+                pl.col("token2").cast(pl.Utf8),
+            ]
+        )
+    )
+
+    # Long form: each market -> 2 rows (token1/token2)
+    markets_long = (
+        markets_df.melt(
             id_vars="market_id",
             value_vars=["token1", "token2"],
             variable_name="side",
             value_name="asset_id",
         )
-        .with_columns([
-            pl.col("asset_id").cast(pl.Utf8),
-            pl.col("market_id").cast(pl.Utf8),
-        ])
+        .with_columns(
+            [
+                pl.col("asset_id").cast(pl.Utf8),
+                pl.col("market_id").cast(pl.Utf8),
+            ]
+        )
+        .filter(pl.col("asset_id").is_not_null() & (pl.col("asset_id") != ""))
+        # asset_id should be unique; keep first if duplicates exist
+        .unique(subset=["asset_id"], keep="first")
     )
+
+    return markets_long
 
 
 def get_processed_df(df: pl.DataFrame, markets_long: pl.DataFrame) -> pl.DataFrame:
-    # 1) Identify the non-USDC asset for each trade (the one that isn't 0)
+    # Ensure ids are strings so joins work
+    df = df.with_columns(
+        [
+            pl.col("makerAssetId").cast(pl.Utf8),
+            pl.col("takerAssetId").cast(pl.Utf8),
+            pl.col("maker").cast(pl.Utf8),
+            pl.col("taker").cast(pl.Utf8),
+            pl.col("transactionHash").cast(pl.Utf8),
+        ]
+    )
+
+    # 1) Identify the non-USDC asset for each trade (the one that isn't "0")
     df = df.with_columns(
         pl.when(pl.col("makerAssetId") != "0")
         .then(pl.col("makerAssetId"))
@@ -52,78 +101,92 @@ def get_processed_df(df: pl.DataFrame, markets_long: pl.DataFrame) -> pl.DataFra
     )
 
     # 3) label columns and keep market_id
-    df = df.with_columns([
-        pl.when(pl.col("makerAssetId") == "0").then(pl.lit("USDC")).otherwise(pl.col("side")).alias("makerAsset"),
-        pl.when(pl.col("takerAssetId") == "0").then(pl.lit("USDC")).otherwise(pl.col("side")).alias("takerAsset"),
-        pl.col("market_id"),
-    ])
+    df = df.with_columns(
+        [
+            pl.when(pl.col("makerAssetId") == "0")
+            .then(pl.lit("USDC"))
+            .otherwise(pl.col("side"))
+            .alias("makerAsset"),
+            pl.when(pl.col("takerAssetId") == "0")
+            .then(pl.lit("USDC"))
+            .otherwise(pl.col("side"))
+            .alias("takerAsset"),
+            pl.col("market_id"),
+        ]
+    )
 
-    df = df[[
-        "timestamp",
-        "market_id",
-        "maker",
-        "makerAsset",
-        "makerAmountFilled",
-        "taker",
-        "takerAsset",
-        "takerAmountFilled",
-        "transactionHash",
-    ]]
+    df = df[
+        [
+            "timestamp",
+            "market_id",
+            "maker",
+            "makerAsset",
+            "makerAmountFilled",
+            "taker",
+            "takerAsset",
+            "takerAmountFilled",
+            "transactionHash",
+        ]
+    ]
 
-    df = df.with_columns([
-        (pl.col("makerAmountFilled") / 10**6).alias("makerAmountFilled"),
-        (pl.col("takerAmountFilled") / 10**6).alias("takerAmountFilled"),
-    ])
+    df = df.with_columns(
+        [
+            (pl.col("makerAmountFilled") / 10**6).alias("makerAmountFilled"),
+            (pl.col("takerAmountFilled") / 10**6).alias("takerAmountFilled"),
+        ]
+    )
 
-    df = df.with_columns([
-        pl.when(pl.col("takerAsset") == "USDC")
-        .then(pl.lit("BUY"))
-        .otherwise(pl.lit("SELL"))
-        .alias("taker_direction"),
+    df = df.with_columns(
+        [
+            pl.when(pl.col("takerAsset") == "USDC")
+            .then(pl.lit("BUY"))
+            .otherwise(pl.lit("SELL"))
+            .alias("taker_direction"),
+            # reverse of taker_direction
+            pl.when(pl.col("takerAsset") == "USDC")
+            .then(pl.lit("SELL"))
+            .otherwise(pl.lit("BUY"))
+            .alias("maker_direction"),
+        ]
+    )
 
-        # reverse of taker_direction
-        pl.when(pl.col("takerAsset") == "USDC")
-        .then(pl.lit("SELL"))
-        .otherwise(pl.lit("BUY"))
-        .alias("maker_direction"),
-    ])
+    df = df.with_columns(
+        [
+            pl.when(pl.col("makerAsset") != "USDC")
+            .then(pl.col("makerAsset"))
+            .otherwise(pl.col("takerAsset"))
+            .alias("nonusdc_side"),
+            pl.when(pl.col("takerAsset") == "USDC")
+            .then(pl.col("takerAmountFilled"))
+            .otherwise(pl.col("makerAmountFilled"))
+            .alias("usd_amount"),
+            pl.when(pl.col("takerAsset") != "USDC")
+            .then(pl.col("takerAmountFilled"))
+            .otherwise(pl.col("makerAmountFilled"))
+            .alias("token_amount"),
+            pl.when(pl.col("takerAsset") == "USDC")
+            .then(pl.col("takerAmountFilled") / pl.col("makerAmountFilled"))
+            .otherwise(pl.col("makerAmountFilled") / pl.col("takerAmountFilled"))
+            .cast(pl.Float64)
+            .alias("price"),
+        ]
+    )
 
-    df = df.with_columns([
-        pl.when(pl.col("makerAsset") != "USDC")
-        .then(pl.col("makerAsset"))
-        .otherwise(pl.col("takerAsset"))
-        .alias("nonusdc_side"),
-
-        pl.when(pl.col("takerAsset") == "USDC")
-        .then(pl.col("takerAmountFilled"))
-        .otherwise(pl.col("makerAmountFilled"))
-        .alias("usd_amount"),
-
-        pl.when(pl.col("takerAsset") != "USDC")
-        .then(pl.col("takerAmountFilled"))
-        .otherwise(pl.col("makerAmountFilled"))
-        .alias("token_amount"),
-
-        pl.when(pl.col("takerAsset") == "USDC")
-        .then(pl.col("takerAmountFilled") / pl.col("makerAmountFilled"))
-        .otherwise(pl.col("makerAmountFilled") / pl.col("takerAmountFilled"))
-        .cast(pl.Float64)
-        .alias("price"),
-    ])
-
-    return df[[
-        "timestamp",
-        "market_id",
-        "maker",
-        "taker",
-        "nonusdc_side",
-        "maker_direction",
-        "taker_direction",
-        "price",
-        "usd_amount",
-        "token_amount",
-        "transactionHash",
-    ]]
+    return df[
+        [
+            "timestamp",
+            "market_id",
+            "maker",
+            "taker",
+            "nonusdc_side",
+            "maker_direction",
+            "taker_direction",
+            "price",
+            "usd_amount",
+            "token_amount",
+            "transactionHash",
+        ]
+    ]
 
 
 def _find_skip_rows_after_header(order_filled_path: str, last_processed: dict) -> int:
@@ -183,7 +246,9 @@ def process_live(batch_size: int = 500_000) -> None:
 
     if os.path.exists(PROCESSED_PATH):
         print(f"✓ Found existing processed file: {PROCESSED_PATH}")
-        result = subprocess.run(["tail", "-n", "1", PROCESSED_PATH], capture_output=True, text=True)
+        result = subprocess.run(
+            ["tail", "-n", "1", PROCESSED_PATH], capture_output=True, text=True
+        )
         last_line = result.stdout.strip()
         splitted = last_line.split(",")
 
@@ -207,13 +272,18 @@ def process_live(batch_size: int = 500_000) -> None:
         "taker": pl.Utf8,
     }
 
-    skip_rows_after_header = _find_skip_rows_after_header(ORDER_FILLED_PATH, last_processed)
+    skip_rows_after_header = _find_skip_rows_after_header(
+        ORDER_FILLED_PATH, last_processed
+    )
     if skip_rows_after_header > 0:
         print(f"↪️  Skipping {skip_rows_after_header:,} rows (resume checkpoint found)")
     elif last_processed:
-        print("⚠️  Could not find exact checkpoint row in orderFilled.csv; processing from start (batched)")
+        print(
+            "⚠️  Could not find exact checkpoint row in orderFilled.csv; processing from start (batched)"
+        )
 
-    markets_long = _build_markets_long()
+    # ✅ markets mapping from parquet
+    markets_long = _build_markets_long(MARKETS_PARQUET_PATH)
 
     if not os.path.isdir("processed"):
         os.makedirs("processed")
@@ -253,13 +323,16 @@ def process_live(batch_size: int = 500_000) -> None:
         wrote_header = False
 
         total_out += new_df.height
-        print(f"✓ processed batch: in={df.height:,} out={new_df.height:,} (total out={total_out:,})")
+        print(
+            f"✓ processed batch: in={df.height:,} out={new_df.height:,} (total out={total_out:,})"
+        )
 
-        # help Python free objects promptly between batches
         del df, new_df
 
     print("=" * 60)
-    print(f"✅ Processing complete! appended_rows={total_out:,} (read_rows={total_in:,})")
+    print(
+        f"✅ Processing complete! appended_rows={total_out:,} (read_rows={total_in:,})"
+    )
     print("=" * 60)
 
 
