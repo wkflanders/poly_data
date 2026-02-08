@@ -10,10 +10,19 @@ import time
 from update_utils.update_markets import update_markets
 
 # Global runtime timestamp - set once when program starts
-RUNTIME_TIMESTAMP = datetime.now().strftime('%Y%m%d_%H%M%S')
+RUNTIME_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 # Columns to save
-COLUMNS_TO_SAVE = ['timestamp', 'maker', 'makerAssetId', 'makerAmountFilled', 'taker', 'takerAssetId', 'takerAmountFilled', 'transactionHash']
+COLUMNS_TO_SAVE = [
+    "timestamp",
+    "maker",
+    "makerAssetId",
+    "makerAmountFilled",
+    "taker",
+    "takerAssetId",
+    "takerAmountFilled",
+    "transactionHash",
+]
 
 if not os.path.isdir('goldsky'):
     os.mkdir('goldsky')
@@ -107,8 +116,8 @@ def scrape(at_once=1000):
     total_records = 0
 
     print(f"\nStarting scrape for orderFilledEvents")
-    
-    output_file = 'goldsky/orderFilled.csv'
+
+    output_file = "goldsky/orderFilled.csv"
     print(f"Output file: {output_file}")
     print(f"Saving columns: {COLUMNS_TO_SAVE}")
 
@@ -138,12 +147,13 @@ def scrape(at_once=1000):
                             transactionHash
                         }
                     }
-                '''
+                """
+        )
 
         query = gql(q_string)
         transport = RequestsHTTPTransport(url=QUERY_URL, verify=True, retries=3)
         client = Client(transport=transport)
-        
+
         try:
             res = client.execute(query)
         except Exception as e:
@@ -211,7 +221,7 @@ def scrape(at_once=1000):
 
         # Save to file
         if os.path.isfile(output_file):
-            df_to_save.to_csv(output_file, index=None, mode='a', header=None)
+            df_to_save.to_csv(output_file, index=None, mode="a", header=None)
         else:
             df_to_save.to_csv(output_file, index=None)
         
@@ -229,12 +239,13 @@ def scrape(at_once=1000):
     print(f"Total new records: {total_records}")
     print(f"Output file: {output_file}")
 
+
 def update_goldsky():
     """Run scraping for orderFilledEvents"""
-    print(f"\n{'='*50}")
+    print(f"\n{'=' * 50}")
     print(f"Starting to scrape orderFilledEvents")
     print(f"Runtime: {RUNTIME_TIMESTAMP}")
-    print(f"{'='*50}")
+    print(f"{'=' * 50}")
     try:
         scrape()
         print(f"Successfully completed orderFilledEvents")
