@@ -5,7 +5,6 @@ from gql import gql, Client
 from gql.transport.requests import RequestsHTTPTransport
 from flatten_json import flatten
 from datetime import datetime, timezone
-import subprocess
 import time
 from update_utils.update_markets import update_markets
 
@@ -24,93 +23,173 @@ COLUMNS_TO_SAVE = [
     "transactionHash",
 ]
 
-if not os.path.isdir('goldsky'):
-    os.mkdir('goldsky')
+if not os.path.isdir("goldsky"):
+    os.mkdir("goldsky")
 
-CURSOR_FILE = 'goldsky/cursor_state.json'
+CURSOR_FILE = "goldsky/cursor_state.json"
+
 
 def save_cursor(timestamp, last_id, sticky_timestamp=None):
     """Save cursor state to file for efficient resume."""
     state = {
-        'last_timestamp': timestamp,
-        'last_id': last_id,
-        'sticky_timestamp': sticky_timestamp
+        "last_timestamp": timestamp,
+        "last_id": last_id,
+        "sticky_timestamp": sticky_timestamp,
     }
-    with open(CURSOR_FILE, 'w') as f:
+    with open(CURSOR_FILE, "w") as f:
         json.dump(state, f)
+
+
+def _read_latest_timestamp_from_csv(cache_file):
+    """Read the latest valid timestamp from the CSV file.
+
+    Robust to:
+      - trailing NUL bytes (\\x00)
+      - partially-written last line (crash during append)
+      - random garbage at EOF
+    """
+    try:
+        # Read header safely (strip NULs)
+        with open(cache_file, "rb") as f:
+            header = (
+                f.readline()
+                .replace(b"\x00", b"")
+                .decode("utf-8", errors="ignore")
+                .strip()
+            )
+
+        if not header:
+            print("Empty header; falling back to timestamp 0")
+            return 0
+
+        headers = header.split(",")
+        if "timestamp" not in headers:
+            print("No 'timestamp' column in header; falling back to timestamp 0")
+            return 0
+
+        ts_idx = headers.index("timestamp")
+
+        # Read from end and find last *valid* CSV line with numeric timestamp
+        with open(cache_file, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            end = f.tell()
+
+            chunk = 1024 * 1024  # 1 MiB
+            offset = 0
+            buf = b""
+
+            while end - offset > 0:
+                read_size = min(chunk, end - offset)
+                offset += read_size
+                f.seek(end - offset)
+                data = f.read(read_size)
+
+                buf = data + buf
+
+                if len(buf) > 8 * chunk:
+                    buf = buf[-8 * chunk :]
+
+                cleaned = buf.replace(b"\x00", b"")
+                lines = cleaned.splitlines()
+
+                for raw in reversed(lines):
+                    if not raw:
+                        continue
+                    line = raw.decode("utf-8", errors="ignore").strip()
+                    if not line or line == header:
+                        continue
+
+                    parts = line.split(",")
+                    if len(parts) <= ts_idx:
+                        continue
+
+                    ts_str = parts[ts_idx].strip().strip('"')
+                    if not ts_str.isdigit():
+                        continue
+
+                    return int(ts_str)
+
+        print("Could not find a valid timestamp near EOF; falling back to timestamp 0")
+        return 0
+
+    except Exception as e:
+        print(f"Error reading latest timestamp from CSV: {e}")
+        return 0
+
 
 def get_latest_cursor():
     """Get the latest cursor state for efficient resume.
-    Returns (timestamp, last_id, sticky_timestamp) tuple."""
-    # First try to load from cursor state file (most efficient)
+
+    Priority:
+      1. cursor_state.json  (exact resume, no duplicates)
+      2. CSV tail scan       (robust to NUL bytes / partial writes)
+      3. timestamp 0         (full re-scrape)
+
+    Returns (timestamp, last_id, sticky_timestamp) tuple.
+    """
+    # --- 1. Try cursor state file (most efficient, preserves sticky state) ---
     if os.path.isfile(CURSOR_FILE):
         try:
-            with open(CURSOR_FILE, 'r') as f:
+            with open(CURSOR_FILE, "r") as f:
                 state = json.load(f)
-            timestamp = state.get('last_timestamp', 0)
-            last_id = state.get('last_id')
-            sticky_timestamp = state.get('sticky_timestamp')
-            
-            # Validate cursor state: if sticky_timestamp is set, last_id must also be set
+            timestamp = state.get("last_timestamp", 0)
+            last_id = state.get("last_id")
+            sticky_timestamp = state.get("sticky_timestamp")
+
+            # Validate: sticky_timestamp requires last_id
             if sticky_timestamp is not None and last_id is None:
-                print(f"Warning: Invalid cursor state (sticky_timestamp={sticky_timestamp} but last_id=None), clearing sticky state")
+                print(
+                    f"Warning: Invalid cursor state "
+                    f"(sticky_timestamp={sticky_timestamp} but last_id=None), "
+                    f"clearing sticky state"
+                )
                 sticky_timestamp = None
-            
+
             if timestamp > 0:
-                readable_time = datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-                print(f'Resuming from cursor state: timestamp {timestamp} ({readable_time}), id: {last_id}, sticky: {sticky_timestamp}')
+                readable_time = datetime.fromtimestamp(
+                    timestamp, tz=timezone.utc
+                ).strftime("%Y-%m-%d %H:%M:%S UTC")
+                print(
+                    f"Resuming from cursor state: timestamp {timestamp} "
+                    f"({readable_time}), id: {last_id}, sticky: {sticky_timestamp}"
+                )
                 return timestamp, last_id, sticky_timestamp
         except Exception as e:
             print(f"Error reading cursor file: {e}")
-    
-    # Fallback: read from CSV file
-    cache_file = 'goldsky/orderFilled.csv'
-    
+
+    # --- 2. Fallback: read from CSV (robust binary scan) ---
+    cache_file = "goldsky/orderFilled.csv"
+
     if not os.path.isfile(cache_file):
         print("No existing file found, starting from beginning of time (timestamp 0)")
         return 0, None, None
-    
-    try:
-        # Use tail to get the last line efficiently
-        result = subprocess.run(['tail', '-n', '1', cache_file], capture_output=True, text=True, check=True)
-        last_line = result.stdout.strip()
-        if last_line:
-            # Get header to find column indices
-            header_result = subprocess.run(['head', '-n', '1', cache_file], capture_output=True, text=True, check=True)
-            headers = header_result.stdout.strip().split(',')
-            
-            if 'timestamp' in headers:
-                timestamp_index = headers.index('timestamp')
-                values = last_line.split(',')
-                if len(values) > timestamp_index:
-                    last_timestamp = int(values[timestamp_index])
-                    readable_time = datetime.fromtimestamp(last_timestamp, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-                    print(f'Resuming from CSV (no cursor file): timestamp {last_timestamp} ({readable_time})')
-                    # Go back 1 second to ensure no data loss (may create some duplicates)
-                    return last_timestamp - 1, None, None
-    except Exception as e:
-        print(f"Error reading latest file with tail: {e}")
-        # Fallback to pandas
-        try:
-            df = pd.read_csv(cache_file)
-            if len(df) > 0 and 'timestamp' in df.columns:
-                last_timestamp = df.iloc[-1]['timestamp']
-                readable_time = datetime.fromtimestamp(int(last_timestamp), tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-                print(f'Resuming from CSV (no cursor file): timestamp {last_timestamp} ({readable_time})')
-                return int(last_timestamp) - 1, None, None
-        except Exception as e2:
-            print(f"Error reading with pandas: {e2}")
-    
-    # Fallback to beginning of time
+
+    last_ts = _read_latest_timestamp_from_csv(cache_file)
+    if last_ts > 0:
+        readable_time = datetime.fromtimestamp(last_ts, tz=timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        )
+        print(
+            f"Resuming from CSV (no cursor file): timestamp {last_ts} ({readable_time})"
+        )
+        # Go back 1 second to ensure no data loss (may create some duplicates)
+        return last_ts - 1, None, None
+
+    # --- 3. Fallback: start from the beginning ---
     print("Falling back to beginning of time (timestamp 0)")
     return 0, None, None
 
+
 def scrape(at_once=1000):
-    QUERY_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
+    QUERY_URL = (
+        "https://api.goldsky.com/api/public/"
+        "project_cl6mb8i9h0003e201j6li0diw/"
+        "subgraphs/orderbook-subgraph/0.0.1/gn"
+    )
     print(f"Query URL: {QUERY_URL}")
     print(f"Runtime timestamp: {RUNTIME_TIMESTAMP}")
-    
-    # Get starting cursor from latest file (includes sticky state for perfect resume)
+
+    # Get starting cursor (includes sticky state for perfect resume)
     last_timestamp, last_id, sticky_timestamp = get_latest_cursor()
     count = 0
     total_records = 0
@@ -124,16 +203,21 @@ def scrape(at_once=1000):
     while True:
         # Build the where clause based on cursor state
         if sticky_timestamp is not None:
-            # We're in sticky mode: stay at this timestamp and paginate by id
+            # Sticky mode: stay at this timestamp and paginate by id
             where_clause = f'timestamp: "{sticky_timestamp}", id_gt: "{last_id}"'
         else:
             # Normal mode: advance by timestamp
             where_clause = f'timestamp_gt: "{last_timestamp}"'
-        
-        q_string = '''query MyQuery {
+
+        q_string = (
+            """query MyQuery {
                         orderFilledEvents(orderBy: timestamp, orderDirection: asc
-                                             first: ''' + str(at_once) + '''
-                                             where: {''' + where_clause + '''}) {
+                                             first: """
+            + str(at_once)
+            + """
+                                             where: {"""
+            + where_clause
+            + """}) {
                             fee
                             id
                             maker
@@ -161,10 +245,10 @@ def scrape(at_once=1000):
             print("Retrying in 5 seconds...")
             time.sleep(5)
             continue
-        
-        if not res['orderFilledEvents'] or len(res['orderFilledEvents']) == 0:
+
+        if not res["orderFilledEvents"] or len(res["orderFilledEvents"]) == 0:
             if sticky_timestamp is not None:
-                # Exhausted events at sticky timestamp, advance to next timestamp
+                # Exhausted events at sticky timestamp, advance to next
                 last_timestamp = sticky_timestamp
                 sticky_timestamp = None
                 last_id = None
@@ -172,49 +256,61 @@ def scrape(at_once=1000):
             print(f"No more data for orderFilledEvents")
             break
 
-        df = pd.DataFrame([flatten(x) for x in res['orderFilledEvents']]).reset_index(drop=True)
-        
+        df = pd.DataFrame([flatten(x) for x in res["orderFilledEvents"]]).reset_index(
+            drop=True
+        )
+
         # Sort by timestamp and id for consistent ordering
-        df = df.sort_values(['timestamp', 'id'], ascending=True).reset_index(drop=True)
-        
-        batch_last_timestamp = int(df.iloc[-1]['timestamp'])
-        batch_last_id = df.iloc[-1]['id']
-        batch_first_timestamp = int(df.iloc[0]['timestamp'])
-        
-        readable_time = datetime.fromtimestamp(batch_last_timestamp, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-        
+        df = df.sort_values(["timestamp", "id"], ascending=True).reset_index(drop=True)
+
+        batch_last_timestamp = int(df.iloc[-1]["timestamp"])
+        batch_last_id = df.iloc[-1]["id"]
+        batch_first_timestamp = int(df.iloc[0]["timestamp"])
+
+        readable_time = datetime.fromtimestamp(
+            batch_last_timestamp, tz=timezone.utc
+        ).strftime("%Y-%m-%d %H:%M:%S UTC")
+
         # Determine if we need sticky cursor for next iteration
         if len(df) >= at_once:
-            # Batch is full - check if all events are at the same timestamp
+            # Batch is full — may be more events at the boundary timestamp
+            sticky_timestamp = batch_last_timestamp
+            last_id = batch_last_id
             if batch_first_timestamp == batch_last_timestamp:
-                # All events at same timestamp, need to continue paginating at this timestamp
-                sticky_timestamp = batch_last_timestamp
-                last_id = batch_last_id
-                print(f"Batch {count + 1}: Timestamp {batch_last_timestamp} ({readable_time}), Records: {len(df)} [STICKY - continuing at same timestamp]")
+                print(
+                    f"Batch {count + 1}: Timestamp {batch_last_timestamp} "
+                    f"({readable_time}), Records: {len(df)} "
+                    f"[STICKY - continuing at same timestamp]"
+                )
             else:
-                # Mixed timestamps - some events might be lost at the boundary timestamp
-                # Stay sticky at the last timestamp to ensure we get all events
-                sticky_timestamp = batch_last_timestamp
-                last_id = batch_last_id
-                print(f"Batch {count + 1}: Timestamps {batch_first_timestamp}-{batch_last_timestamp} ({readable_time}), Records: {len(df)} [STICKY - ensuring complete timestamp]")
+                print(
+                    f"Batch {count + 1}: Timestamps "
+                    f"{batch_first_timestamp}-{batch_last_timestamp} "
+                    f"({readable_time}), Records: {len(df)} "
+                    f"[STICKY - ensuring complete timestamp]"
+                )
         else:
-            # Batch not full - we have all events, can advance normally
+            # Batch not full — we have all events, can advance normally
             if sticky_timestamp is not None:
-                # We were in sticky mode, now exhausted - advance past this timestamp
                 last_timestamp = sticky_timestamp
                 sticky_timestamp = None
                 last_id = None
-                print(f"Batch {count + 1}: Timestamp {batch_last_timestamp} ({readable_time}), Records: {len(df)} [STICKY COMPLETE]")
+                print(
+                    f"Batch {count + 1}: Timestamp {batch_last_timestamp} "
+                    f"({readable_time}), Records: {len(df)} [STICKY COMPLETE]"
+                )
             else:
-                # Normal advancement
                 last_timestamp = batch_last_timestamp
-                print(f"Batch {count + 1}: Last timestamp {batch_last_timestamp} ({readable_time}), Records: {len(df)}")
-        
+                print(
+                    f"Batch {count + 1}: Last timestamp {batch_last_timestamp} "
+                    f"({readable_time}), Records: {len(df)}"
+                )
+
         count += 1
         total_records += len(df)
 
         # Remove duplicates (by id to be safe)
-        df = df.drop_duplicates(subset=['id'])
+        df = df.drop_duplicates(subset=["id"])
 
         # Filter to only the columns we want to save
         df_to_save = df[COLUMNS_TO_SAVE].copy()
@@ -224,7 +320,7 @@ def scrape(at_once=1000):
             df_to_save.to_csv(output_file, index=None, mode="a", header=None)
         else:
             df_to_save.to_csv(output_file, index=None)
-        
+
         # Save cursor state for efficient resume (no duplicates on restart)
         save_cursor(last_timestamp, last_id, sticky_timestamp)
 
@@ -234,7 +330,7 @@ def scrape(at_once=1000):
     # Clear cursor file on successful completion
     if os.path.isfile(CURSOR_FILE):
         os.remove(CURSOR_FILE)
-    
+
     print(f"Finished scraping orderFilledEvents")
     print(f"Total new records: {total_records}")
     print(f"Output file: {output_file}")
