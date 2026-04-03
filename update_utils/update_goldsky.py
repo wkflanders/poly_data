@@ -252,19 +252,23 @@ def scrape_range(start_ts, end_ts, worker_id, at_once=1000):
         ).strftime("%Y-%m-%d %H:%M:%S UTC")
 
         # Determine if we need sticky cursor
+        should_break = False
         if len(df) >= at_once:
             sticky_timestamp = batch_last_timestamp
             last_id = batch_last_id
             tag = "STICKY"
         else:
             if sticky_timestamp is not None:
+                # Just finished draining a sticky timestamp - keep going
                 last_timestamp = sticky_timestamp
                 sticky_timestamp = None
                 last_id = None
                 tag = "STICKY COMPLETE"
             else:
+                # Normal incomplete batch - we've reached the end of this range
                 last_timestamp = batch_last_timestamp
                 tag = ""
+                should_break = True
 
         batch_count += 1
         total_records += len(df)
@@ -278,7 +282,7 @@ def scrape_range(start_ts, end_ts, worker_id, at_once=1000):
                 f"  [Worker {worker_id}] Batch {batch_count}: {readable_time}, {total_records:,} records so far {f'[{tag}]' if tag else ''}"
             )
 
-        if len(df) < at_once and sticky_timestamp is None:
+        if should_break:
             break
 
     session.close()
