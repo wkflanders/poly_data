@@ -12,7 +12,7 @@ import threading
 # Global runtime timestamp - set once when program starts
 RUNTIME_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-QUERY_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/polymarket-orderbook-resync/prod/gn"
+QUERY_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
 
 # Columns to save
 COLUMNS_TO_SAVE = [
@@ -152,11 +152,11 @@ def query_goldsky(session, where_clause, at_once=1000):
         + """}) {
                         fee
                         id
-                        maker { id }
+                        maker
                         makerAmountFilled
                         makerAssetId
                         orderHash
-                        taker { id }
+                        taker
                         takerAmountFilled
                         takerAssetId
                         timestamp
@@ -183,9 +183,8 @@ def query_goldsky(session, where_clause, at_once=1000):
 
 
 def process_batch(events):
-    """Flatten events and rename maker/taker fields."""
+    """Flatten events into a DataFrame."""
     df = pd.DataFrame([flatten(x) for x in events]).reset_index(drop=True)
-    df = df.rename(columns={"maker_id": "maker", "taker_id": "taker"})
     df = df.sort_values(["timestamp", "id"], ascending=True).reset_index(drop=True)
     return df
 
