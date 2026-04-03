@@ -4,6 +4,7 @@ import json
 import os
 import time
 from typing import List, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 def count_csv_lines(csv_filename: str) -> int:
@@ -21,58 +22,90 @@ def count_csv_lines(csv_filename: str) -> int:
         return 0
 
 
-def fetch_event_tags(session, event_ids: List[str]) -> Dict[str, str]:
-    """Fetch tags for a list of event IDs. Returns {event_id: 'tag1|tag2|tag3'}"""
-    tags_map = {}
-    if not event_ids:
-        return tags_map
+def fetch_market_tags(session, market_id):
+    """Fetch tags for a single market. Returns (market_id, 'tag1|tag2|...')"""
+    for attempt in range(3):
+        try:
+            resp = session.get(
+                f"https://gamma-api.polymarket.com/markets/{market_id}/tags", timeout=15
+            )
+            if resp.status_code == 200:
+                tags = resp.json()
+                labels = [
+                    t["label"] for t in tags if t.get("label") and t["label"] != "All"
+                ]
+                return (market_id, "|".join(labels))
+            elif resp.status_code == 429:
+                time.sleep(5 * (attempt + 1))
+            else:
+                return (market_id, "")
+        except Exception:
+            time.sleep(2 * (attempt + 1))
+    return (market_id, "")
 
-    # Deduplicate
-    unique_ids = list(set(event_ids))
 
-    # Fetch events in batches (the events endpoint supports id filtering)
-    for i in range(0, len(unique_ids), 50):
-        batch_ids = unique_ids[i : i + 50]
-        for event_id in batch_ids:
-            if event_id in tags_map:
-                continue
+def backfill_tags(csv_filename: str, num_workers: int = 16):
+    """Read existing CSV, fetch tags for markets missing them, rewrite CSV."""
+    print(f"\n📋 Backfilling tags for {csv_filename}...")
+
+    # Read all rows
+    with open(csv_filename, "r", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        headers = next(reader)
+        rows = list(reader)
+
+    # Check if tags column exists
+    if "tags" not in headers:
+        headers.append("tags")
+        rows = [row + [""] for row in rows]
+
+    tags_idx = headers.index("tags")
+    id_idx = headers.index("id")
+
+    # Find markets that need tags
+    needs_tags = [(i, row[id_idx]) for i, row in enumerate(rows) if not row[tags_idx]]
+
+    if not needs_tags:
+        print("✓ All markets already have tags.")
+        return
+
+    print(
+        f"  Fetching tags for {len(needs_tags):,} markets with {num_workers} workers..."
+    )
+
+    session = requests.Session()
+    completed = 0
+    total = len(needs_tags)
+
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {}
+        for row_idx, market_id in needs_tags:
+            future = executor.submit(fetch_market_tags, session, market_id)
+            futures[future] = row_idx
+
+        for future in as_completed(futures):
+            row_idx = futures[future]
             try:
-                resp = session.get(
-                    f"https://gamma-api.polymarket.com/events/{event_id}", timeout=15
-                )
-                if resp.status_code == 200:
-                    event = resp.json()
-                    tags = event.get("tags", [])
-                    # Extract just the labels, skip "All" tag
-                    tag_labels = [
-                        t["label"]
-                        for t in tags
-                        if t.get("label") and t["label"] != "All"
-                    ]
-                    tags_map[event_id] = "|".join(tag_labels)
-                elif resp.status_code == 429:
-                    print(f"  Rate limited fetching event tags - waiting 10s...")
-                    time.sleep(10)
-                    # Retry this one
-                    resp = session.get(
-                        f"https://gamma-api.polymarket.com/events/{event_id}",
-                        timeout=15,
-                    )
-                    if resp.status_code == 200:
-                        event = resp.json()
-                        tags = event.get("tags", [])
-                        tag_labels = [
-                            t["label"]
-                            for t in tags
-                            if t.get("label") and t["label"] != "All"
-                        ]
-                        tags_map[event_id] = "|".join(tag_labels)
-                else:
-                    tags_map[event_id] = ""
-            except Exception as e:
-                tags_map[event_id] = ""
+                market_id, tags_str = future.result()
+                rows[row_idx][tags_idx] = tags_str
+            except Exception:
+                pass
 
-    return tags_map
+            completed += 1
+            if completed % 500 == 0:
+                print(
+                    f"  Progress: {completed:,}/{total:,} ({completed * 100 // total}%)"
+                )
+
+    session.close()
+
+    # Rewrite CSV
+    with open(csv_filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        writer.writerows(rows)
+
+    print(f"✓ Tags backfilled for {len(needs_tags):,} markets.")
 
 
 def update_markets(csv_filename: str = "markets.csv", batch_size: int = 500):
@@ -114,10 +147,9 @@ def update_markets(csv_filename: str = "markets.csv", batch_size: int = 500):
         with open(csv_filename, "r", encoding="utf-8") as f:
             existing_headers = f.readline().strip().split(",")
         if "tags" not in existing_headers:
-            print("⚠ Existing CSV missing 'tags' column. Rebuilding from scratch.")
-            print("  (Rename the old file if you want to keep it)")
-            current_offset = 0
-            file_exists = False
+            print(
+                "⚠ Existing CSV missing 'tags' column - will add it during tag backfill."
+            )
 
     if file_exists:
         print(
@@ -129,7 +161,6 @@ def update_markets(csv_filename: str = "markets.csv", batch_size: int = 500):
         mode = "w"
 
     total_fetched = 0
-    session = requests.Session()
 
     with open(csv_filename, mode, newline="", encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
@@ -149,7 +180,7 @@ def update_markets(csv_filename: str = "markets.csv", batch_size: int = 500):
                     "offset": current_offset,
                 }
 
-                response = session.get(base_url, params=params, timeout=30)
+                response = requests.get(base_url, params=params, timeout=30)
 
                 # Handle different HTTP status codes
                 if response.status_code == 500:
@@ -173,21 +204,6 @@ def update_markets(csv_filename: str = "markets.csv", batch_size: int = 500):
                         f"No more markets found at offset {current_offset}. Completed!"
                     )
                     break
-
-                # Collect event IDs for tag lookup
-                event_ids = []
-                market_event_map = {}  # market_id -> event_id
-                for market in markets:
-                    events = market.get("events", [])
-                    if events and len(events) > 0:
-                        event_id = str(events[0].get("id", ""))
-                        if event_id:
-                            event_ids.append(event_id)
-                            market_event_map[market.get("id", "")] = event_id
-
-                # Batch fetch tags for all events in this batch
-                print(f"  Fetching tags for {len(set(event_ids))} unique events...")
-                tags_map = fetch_event_tags(session, event_ids)
 
                 batch_count = 0
 
@@ -228,14 +244,9 @@ def update_markets(csv_filename: str = "markets.csv", batch_size: int = 500):
                         if market.get("events") and len(market.get("events", [])) > 0:
                             ticker = market["events"][0].get("ticker", "")
 
-                        # Get tags from the event
-                        market_id = market.get("id", "")
-                        event_id = market_event_map.get(market_id, "")
-                        tags = tags_map.get(event_id, "")
-
                         row = [
                             market.get("createdAt", ""),
-                            market_id,
+                            market.get("id", ""),
                             question_text,
                             answer1,
                             answer2,
@@ -247,7 +258,7 @@ def update_markets(csv_filename: str = "markets.csv", batch_size: int = 500):
                             market.get("volume", ""),
                             ticker,
                             market.get("closedTime", ""),
-                            tags,
+                            "",  # tags - backfilled after
                         ]
 
                         writer.writerow(row)
@@ -260,7 +271,7 @@ def update_markets(csv_filename: str = "markets.csv", batch_size: int = 500):
                         continue
 
                 total_fetched += batch_count
-                current_offset += batch_count  # Increment by actual records processed
+                current_offset += batch_count
 
                 print(
                     f"Processed {batch_count} markets. Total new: {total_fetched}. Next offset: {current_offset}"
@@ -284,12 +295,13 @@ def update_markets(csv_filename: str = "markets.csv", batch_size: int = 500):
                 time.sleep(3)
                 continue
 
-    session.close()
     print(f"\nCompleted! Fetched {total_fetched} new markets.")
     print(f"Data saved to: {csv_filename}")
     print(f"Total records: {current_offset}")
 
+    # Phase 2: backfill tags for any markets missing them
+    backfill_tags(csv_filename)
+
 
 # if __name__ == "__main__":
 #     update_markets(batch_size=500)
-
