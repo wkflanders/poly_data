@@ -2,9 +2,7 @@ import requests
 import csv
 import json
 import os
-import time
 from typing import List, Dict
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 def count_csv_lines(csv_filename: str) -> int:
@@ -20,92 +18,6 @@ def count_csv_lines(csv_filename: str) -> int:
     except Exception as e:
         print(f"Error reading CSV: {e}")
         return 0
-
-
-def fetch_market_tags(session, market_id):
-    """Fetch tags for a single market. Returns (market_id, 'tag1|tag2|...')"""
-    for attempt in range(3):
-        try:
-            resp = session.get(
-                f"https://gamma-api.polymarket.com/markets/{market_id}/tags", timeout=15
-            )
-            if resp.status_code == 200:
-                tags = resp.json()
-                labels = [
-                    t["label"] for t in tags if t.get("label") and t["label"] != "All"
-                ]
-                return (market_id, "|".join(labels))
-            elif resp.status_code == 429:
-                time.sleep(5 * (attempt + 1))
-            else:
-                return (market_id, "")
-        except Exception:
-            time.sleep(2 * (attempt + 1))
-    return (market_id, "")
-
-
-def backfill_tags(csv_filename: str, num_workers: int = 16):
-    """Read existing CSV, fetch tags for markets missing them, rewrite CSV."""
-    print(f"\n📋 Backfilling tags for {csv_filename}...")
-
-    # Read all rows
-    with open(csv_filename, "r", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        headers = next(reader)
-        rows = list(reader)
-
-    # Check if tags column exists
-    if "tags" not in headers:
-        headers.append("tags")
-        rows = [row + [""] for row in rows]
-
-    tags_idx = headers.index("tags")
-    id_idx = headers.index("id")
-
-    # Find markets that need tags
-    needs_tags = [(i, row[id_idx]) for i, row in enumerate(rows) if not row[tags_idx]]
-
-    if not needs_tags:
-        print("✓ All markets already have tags.")
-        return
-
-    print(
-        f"  Fetching tags for {len(needs_tags):,} markets with {num_workers} workers..."
-    )
-
-    session = requests.Session()
-    completed = 0
-    total = len(needs_tags)
-
-    with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        futures = {}
-        for row_idx, market_id in needs_tags:
-            future = executor.submit(fetch_market_tags, session, market_id)
-            futures[future] = row_idx
-
-        for future in as_completed(futures):
-            row_idx = futures[future]
-            try:
-                market_id, tags_str = future.result()
-                rows[row_idx][tags_idx] = tags_str
-            except Exception:
-                pass
-
-            completed += 1
-            if completed % 500 == 0:
-                print(
-                    f"  Progress: {completed:,}/{total:,} ({completed * 100 // total}%)"
-                )
-
-    session.close()
-
-    # Rewrite CSV
-    with open(csv_filename, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(headers)
-        writer.writerows(rows)
-
-    print(f"✓ Tags backfilled for {len(needs_tags):,} markets.")
 
 
 def update_markets(csv_filename: str = "markets.csv", batch_size: int = 500):
@@ -135,21 +47,11 @@ def update_markets(csv_filename: str = "markets.csv", batch_size: int = 500):
         "volume",
         "ticker",
         "closedTime",
-        "tags",
     ]
 
     # Dynamically set offset based on existing records
     current_offset = count_csv_lines(csv_filename)
     file_exists = os.path.exists(csv_filename) and current_offset > 0
-
-    if file_exists:
-        # Check if existing file has the tags column
-        with open(csv_filename, "r", encoding="utf-8") as f:
-            existing_headers = f.readline().strip().split(",")
-        if "tags" not in existing_headers:
-            print(
-                "⚠ Existing CSV missing 'tags' column - will add it during tag backfill."
-            )
 
     if file_exists:
         print(
@@ -185,15 +87,21 @@ def update_markets(csv_filename: str = "markets.csv", batch_size: int = 500):
                 # Handle different HTTP status codes
                 if response.status_code == 500:
                     print(f"Server error (500) - retrying in 5 seconds...")
+                    import time
+
                     time.sleep(5)
                     continue
                 elif response.status_code == 429:
                     print(f"Rate limited (429) - waiting 10 seconds...")
+                    import time
+
                     time.sleep(10)
                     continue
                 elif response.status_code != 200:
                     print(f"API error {response.status_code}: {response.text}")
                     print("Retrying in 3 seconds...")
+                    import time
+
                     time.sleep(3)
                     continue
 
@@ -258,7 +166,6 @@ def update_markets(csv_filename: str = "markets.csv", batch_size: int = 500):
                             market.get("volume", ""),
                             ticker,
                             market.get("closedTime", ""),
-                            "",  # tags - backfilled after
                         ]
 
                         writer.writerow(row)
@@ -271,7 +178,7 @@ def update_markets(csv_filename: str = "markets.csv", batch_size: int = 500):
                         continue
 
                 total_fetched += batch_count
-                current_offset += batch_count
+                current_offset += batch_count  # Increment by actual records processed
 
                 print(
                     f"Processed {batch_count} markets. Total new: {total_fetched}. Next offset: {current_offset}"
@@ -287,20 +194,21 @@ def update_markets(csv_filename: str = "markets.csv", batch_size: int = 500):
             except requests.exceptions.RequestException as e:
                 print(f"Network error: {e}")
                 print(f"Retrying in 5 seconds...")
+                import time
+
                 time.sleep(5)
                 continue
             except Exception as e:
                 print(f"Unexpected error: {e}")
                 print(f"Retrying in 3 seconds...")
+                import time
+
                 time.sleep(3)
                 continue
 
     print(f"\nCompleted! Fetched {total_fetched} new markets.")
     print(f"Data saved to: {csv_filename}")
     print(f"Total records: {current_offset}")
-
-    # Phase 2: backfill tags for any markets missing them
-    backfill_tags(csv_filename)
 
 
 # if __name__ == "__main__":
