@@ -54,7 +54,6 @@ def save_cursor(timestamp, last_id, sticky_timestamp=None):
 def get_latest_cursor():
     """Get the latest cursor state for efficient resume.
     Returns (timestamp, last_id, sticky_timestamp) tuple."""
-    # First try to load from cursor state file (most efficient)
     if os.path.isfile(CURSOR_FILE):
         try:
             with open(CURSOR_FILE, "r") as f:
@@ -63,7 +62,6 @@ def get_latest_cursor():
             last_id = state.get("last_id")
             sticky_timestamp = state.get("sticky_timestamp")
 
-            # Validate cursor state: if sticky_timestamp is set, last_id must also be set
             if sticky_timestamp is not None and last_id is None:
                 print(
                     f"Warning: Invalid cursor state (sticky_timestamp={sticky_timestamp} but last_id=None), clearing sticky state"
@@ -81,7 +79,6 @@ def get_latest_cursor():
         except Exception as e:
             print(f"Error reading cursor file: {e}")
 
-    # Fallback: read from CSV file
     cache_file = "goldsky/orderFilled.csv"
 
     if not os.path.isfile(cache_file):
@@ -89,13 +86,11 @@ def get_latest_cursor():
         return 0, None, None
 
     try:
-        # Use tail to get the last line efficiently
         result = subprocess.run(
             ["tail", "-n", "1", cache_file], capture_output=True, text=True, check=True
         )
         last_line = result.stdout.strip()
         if last_line:
-            # Get header to find column indices
             header_result = subprocess.run(
                 ["head", "-n", "1", cache_file],
                 capture_output=True,
@@ -115,11 +110,9 @@ def get_latest_cursor():
                     print(
                         f"Resuming from CSV (no cursor file): timestamp {last_timestamp} ({readable_time})"
                     )
-                    # Go back 1 second to ensure no data loss (may create some duplicates)
                     return last_timestamp - 1, None, None
     except Exception as e:
         print(f"Error reading latest file with tail: {e}")
-        # Fallback to pandas
         try:
             df = pd.read_csv(cache_file)
             if len(df) > 0 and "timestamp" in df.columns:
@@ -134,7 +127,6 @@ def get_latest_cursor():
         except Exception as e2:
             print(f"Error reading with pandas: {e2}")
 
-    # Fallback to beginning of time
     print("Falling back to beginning of time (timestamp 0)")
     return 0, None, None
 
@@ -204,20 +196,21 @@ def get_latest_remote_timestamp(session):
     return None
 
 
-def scrape_range(start_ts, end_ts, worker_id, at_once=1000):
-    """Scrape a specific time range. Returns list of DataFrames."""
+def scrape_range(start_ts, end_ts, worker_id, temp_dir, at_once=1000):
+    """Scrape a specific time range. Writes directly to a temp file."""
     session = req.Session()
     session.headers.update({"Content-Type": "application/json"})
+
+    temp_file = os.path.join(temp_dir, f"worker_{worker_id}.csv")
+    file_started = False
 
     last_timestamp = start_ts
     last_id = None
     sticky_timestamp = None
     total_records = 0
     batch_count = 0
-    all_dfs = []
 
     while True:
-        # Build where clause
         if sticky_timestamp is not None:
             where_clause = f'timestamp: "{sticky_timestamp}", id_gt: "{last_id}"'
         else:
@@ -244,13 +237,11 @@ def scrape_range(start_ts, end_ts, worker_id, at_once=1000):
 
         batch_last_timestamp = int(df.iloc[-1]["timestamp"])
         batch_last_id = df.iloc[-1]["id"]
-        batch_first_timestamp = int(df.iloc[0]["timestamp"])
 
         readable_time = datetime.fromtimestamp(
             batch_last_timestamp, tz=timezone.utc
         ).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-        # Determine if we need sticky cursor
         should_break = False
         if len(df) >= at_once:
             sticky_timestamp = batch_last_timestamp
@@ -258,23 +249,27 @@ def scrape_range(start_ts, end_ts, worker_id, at_once=1000):
             tag = "STICKY"
         else:
             if sticky_timestamp is not None:
-                # Just finished draining a sticky timestamp - keep going
                 last_timestamp = sticky_timestamp
                 sticky_timestamp = None
                 last_id = None
                 tag = "STICKY COMPLETE"
             else:
-                # Normal incomplete batch - we've reached the end of this range
                 last_timestamp = batch_last_timestamp
                 tag = ""
                 should_break = True
 
         batch_count += 1
-        total_records += len(df)
 
         df = df.drop_duplicates(subset=["id"])
         df_to_save = df[COLUMNS_TO_SAVE].copy()
-        all_dfs.append(df_to_save)
+        total_records += len(df_to_save)
+
+        # Write immediately to temp file
+        if not file_started:
+            df_to_save.to_csv(temp_file, index=None)
+            file_started = True
+        else:
+            df_to_save.to_csv(temp_file, index=None, mode="a", header=False)
 
         if batch_count % 50 == 0:
             tprint(
@@ -286,23 +281,25 @@ def scrape_range(start_ts, end_ts, worker_id, at_once=1000):
 
     session.close()
     tprint(
-        f"  [Worker {worker_id}] Done: {total_records:,} records in {batch_count} batches"
+        f"  [Worker {worker_id}] Done: {total_records:,} records in {batch_count} batches -> {temp_file}"
     )
-    return all_dfs
+    return total_records
 
 
 def scrape(at_once=1000, num_workers=8):
     print(f"Query URL: {QUERY_URL}")
     print(f"Runtime timestamp: {RUNTIME_TIMESTAMP}")
 
-    # Get starting cursor
     last_timestamp, last_id, sticky_timestamp = get_latest_cursor()
 
     output_file = "goldsky/orderFilled.csv"
+    temp_dir = "goldsky/temp_chunks"
+    os.makedirs(temp_dir, exist_ok=True)
+
     print(f"Output file: {output_file}")
     print(f"Saving columns: {COLUMNS_TO_SAVE}")
 
-    # If we have a sticky cursor, drain it first (single-threaded)
+    # Drain sticky cursor first (single-threaded)
     session = req.Session()
     session.headers.update({"Content-Type": "application/json"})
 
@@ -349,7 +346,7 @@ def scrape(at_once=1000, num_workers=8):
 
         save_cursor(last_timestamp, last_id, sticky_timestamp)
 
-    # Get the latest timestamp from the subgraph
+    # Get latest remote timestamp
     print("\nChecking latest available data...")
     remote_latest = get_latest_remote_timestamp(session)
     session.close()
@@ -378,10 +375,7 @@ def scrape(at_once=1000, num_workers=8):
             os.remove(CURSOR_FILE)
         return
 
-    # Split time range into chunks for parallel scraping
-    effective_workers = min(
-        num_workers, max(1, gap // 3600)
-    )  # at least 1 hour per worker
+    effective_workers = min(num_workers, max(1, gap // 3600))
     chunk_size = gap // effective_workers
 
     ranges = []
@@ -400,38 +394,64 @@ def scrape(at_once=1000, num_workers=8):
         re_ = datetime.fromtimestamp(e, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
         print(f"  Worker {i}: {rs} -> {re_}")
 
-    # Run workers in parallel
-    all_results = [None] * effective_workers
-
+    # Run workers in parallel - each writes to its own temp file
     with ThreadPoolExecutor(max_workers=effective_workers) as executor:
         futures = {}
         for i, (start_ts, end_ts) in enumerate(ranges):
-            future = executor.submit(scrape_range, start_ts, end_ts, i, at_once)
+            future = executor.submit(
+                scrape_range, start_ts, end_ts, i, temp_dir, at_once
+            )
             futures[future] = i
 
         for future in as_completed(futures):
             worker_id = futures[future]
             try:
-                all_results[worker_id] = future.result()
+                future.result()
             except Exception as e:
                 print(f"Worker {worker_id} failed: {e}")
-                all_results[worker_id] = []
 
-    # Concatenate results in order and write to file
-    print("\nMerging results...")
+    # Merge temp files in order by appending to main CSV
+    print("\nMerging temp files into main CSV...")
     total_records = 0
     file_exists = os.path.isfile(output_file)
 
-    for worker_id, dfs in enumerate(all_results):
-        if not dfs:
+    for i in range(effective_workers):
+        temp_file = os.path.join(temp_dir, f"worker_{i}.csv")
+        if not os.path.isfile(temp_file):
             continue
-        for df_chunk in dfs:
-            if file_exists:
-                df_chunk.to_csv(output_file, index=None, mode="a", header=None)
-            else:
-                df_chunk.to_csv(output_file, index=None)
-                file_exists = True
-            total_records += len(df_chunk)
+
+        # Use cat/tail to append efficiently (skip header of temp file)
+        if file_exists:
+            result = subprocess.run(
+                f"tail -n +2 '{temp_file}' >> '{output_file}'",
+                shell=True,
+                capture_output=True,
+                text=True,
+            )
+        else:
+            result = subprocess.run(
+                f"cp '{temp_file}' '{output_file}'",
+                shell=True,
+                capture_output=True,
+                text=True,
+            )
+            file_exists = True
+
+        # Count lines added
+        count_result = subprocess.run(
+            f"wc -l < '{temp_file}'", shell=True, capture_output=True, text=True
+        )
+        lines = int(count_result.stdout.strip()) - 1  # minus header
+        total_records += lines
+        print(f"  Merged worker {i}: {lines:,} records")
+
+        os.remove(temp_file)
+
+    # Clean up temp dir
+    try:
+        os.rmdir(temp_dir)
+    except OSError:
+        pass
 
     # Clear cursor file on successful completion
     if os.path.isfile(CURSOR_FILE):
