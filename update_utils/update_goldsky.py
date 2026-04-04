@@ -1,5 +1,6 @@
 import os
 import json
+import signal
 import pandas as pd
 from flatten_json import flatten
 from datetime import datetime, timezone
@@ -31,6 +32,9 @@ if not os.path.isdir("goldsky"):
 
 CURSOR_FILE = "goldsky/cursor_state.json"
 
+# Shared shutdown flag - workers check this to stop cleanly
+shutdown_event = threading.Event()
+
 # Lock for printing
 print_lock = threading.Lock()
 
@@ -38,6 +42,17 @@ print_lock = threading.Lock()
 def tprint(*args, **kwargs):
     with print_lock:
         print(*args, **kwargs)
+
+
+def handle_shutdown(signum, frame):
+    tprint(
+        "\n⚠ Shutdown requested - workers will stop after current batch. Data is safe in temp files."
+    )
+    shutdown_event.set()
+
+
+signal.signal(signal.SIGINT, handle_shutdown)
+signal.signal(signal.SIGTERM, handle_shutdown)
 
 
 def save_cursor(timestamp, last_id, sticky_timestamp=None):
@@ -132,7 +147,7 @@ def get_latest_cursor():
 
 
 def query_goldsky(session, where_clause, at_once=1000):
-    """Execute a single GraphQL query and return parsed results."""
+    """Execute a single GraphQL query. Retries forever with backoff until shutdown."""
     q_string = (
         """query MyQuery {
                     orderFilledEvents(orderBy: timestamp, orderDirection: asc
@@ -158,7 +173,8 @@ def query_goldsky(session, where_clause, at_once=1000):
             """
     )
 
-    for attempt in range(5):
+    attempt = 0
+    while not shutdown_event.is_set():
         try:
             resp = session.post(QUERY_URL, json={"query": q_string}, timeout=30)
             resp.raise_for_status()
@@ -167,11 +183,15 @@ def query_goldsky(session, where_clause, at_once=1000):
                 raise Exception(f"GraphQL errors: {data['errors']}")
             return data["data"]["orderFilledEvents"]
         except Exception as e:
-            if attempt < 4:
-                time.sleep(2 * (attempt + 1))
-            else:
-                raise e
-    return []
+            attempt += 1
+            wait = min(60, 2 * attempt)  # backoff up to 60s
+            if attempt % 5 == 0:
+                tprint(
+                    f"    Query failing (attempt {attempt}): {e}. Retrying in {wait}s..."
+                )
+            time.sleep(wait)
+
+    return []  # shutdown requested
 
 
 def process_batch(events):
@@ -210,7 +230,7 @@ def scrape_range(start_ts, end_ts, worker_id, temp_dir, at_once=1000):
     total_records = 0
     batch_count = 0
 
-    while True:
+    while not shutdown_event.is_set():
         if sticky_timestamp is not None:
             where_clause = f'timestamp: "{sticky_timestamp}", id_gt: "{last_id}"'
         else:
@@ -218,12 +238,10 @@ def scrape_range(start_ts, end_ts, worker_id, temp_dir, at_once=1000):
                 f'timestamp_gt: "{last_timestamp}", timestamp_lte: "{end_ts}"'
             )
 
-        try:
-            events = query_goldsky(session, where_clause, at_once)
-        except Exception as e:
-            tprint(f"  [Worker {worker_id}] Query error: {e}")
-            time.sleep(5)
-            continue
+        events = query_goldsky(session, where_clause, at_once)
+
+        if shutdown_event.is_set():
+            break
 
         if not events:
             if sticky_timestamp is not None:
@@ -273,7 +291,7 @@ def scrape_range(start_ts, end_ts, worker_id, temp_dir, at_once=1000):
 
         if batch_count % 50 == 0:
             tprint(
-                f"  [Worker {worker_id}] Batch {batch_count}: {readable_time}, {total_records:,} records so far {f'[{tag}]' if tag else ''}"
+                f"  [Worker {worker_id}] Batch {batch_count}: {readable_time}, {total_records:,} records {f'[{tag}]' if tag else ''}"
             )
 
         if should_break:
@@ -281,7 +299,7 @@ def scrape_range(start_ts, end_ts, worker_id, temp_dir, at_once=1000):
 
     session.close()
     tprint(
-        f"  [Worker {worker_id}] Done: {total_records:,} records in {batch_count} batches -> {temp_file}"
+        f"  [Worker {worker_id}] Done: {total_records:,} records in {batch_count} batches"
     )
     return total_records
 
@@ -289,6 +307,7 @@ def scrape_range(start_ts, end_ts, worker_id, temp_dir, at_once=1000):
 def scrape(at_once=1000, num_workers=8):
     print(f"Query URL: {QUERY_URL}")
     print(f"Runtime timestamp: {RUNTIME_TIMESTAMP}")
+    print(f"Workers: {num_workers}")
 
     last_timestamp, last_id, sticky_timestamp = get_latest_cursor()
 
@@ -297,6 +316,7 @@ def scrape(at_once=1000, num_workers=8):
     os.makedirs(temp_dir, exist_ok=True)
 
     print(f"Output file: {output_file}")
+    print(f"Temp dir: {temp_dir}")
     print(f"Saving columns: {COLUMNS_TO_SAVE}")
 
     # Drain sticky cursor first (single-threaded)
@@ -305,14 +325,12 @@ def scrape(at_once=1000, num_workers=8):
 
     if sticky_timestamp is not None:
         print(f"\nDraining sticky cursor at timestamp {sticky_timestamp}...")
-        while True:
+        while not shutdown_event.is_set():
             where_clause = f'timestamp: "{sticky_timestamp}", id_gt: "{last_id}"'
-            try:
-                events = query_goldsky(session, where_clause, at_once)
-            except Exception as e:
-                print(f"Query error during sticky drain: {e}")
-                time.sleep(5)
-                continue
+            events = query_goldsky(session, where_clause, at_once)
+
+            if shutdown_event.is_set():
+                break
 
             if not events:
                 last_timestamp = sticky_timestamp
@@ -345,6 +363,11 @@ def scrape(at_once=1000, num_workers=8):
                 break
 
         save_cursor(last_timestamp, last_id, sticky_timestamp)
+
+    if shutdown_event.is_set():
+        print("Shutdown before scraping started. Exiting.")
+        session.close()
+        return
 
     # Get latest remote timestamp
     print("\nChecking latest available data...")
@@ -388,7 +411,9 @@ def scrape(at_once=1000, num_workers=8):
         )
         ranges.append((chunk_start, chunk_end))
 
-    print(f"\nScraping with {effective_workers} parallel workers...")
+    print(
+        f"\nScraping with {effective_workers} parallel workers (Ctrl+C to stop safely)..."
+    )
     for i, (s, e) in enumerate(ranges):
         rs = datetime.fromtimestamp(s, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
         re_ = datetime.fromtimestamp(e, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
@@ -410,7 +435,21 @@ def scrape(at_once=1000, num_workers=8):
             except Exception as e:
                 print(f"Worker {worker_id} failed: {e}")
 
-    # Merge temp files in order by appending to main CSV
+    if shutdown_event.is_set():
+        print(f"\n⚠ Stopped early. Partial data saved in {temp_dir}/")
+        print(
+            f"  Temp files are safe. They will NOT be merged into {output_file} automatically."
+        )
+        print(f"  To merge manually when ready:")
+        print(f"    for i in $(seq 0 {effective_workers - 1}); do")
+        print(
+            f"      [ -f {temp_dir}/worker_$i.csv ] && tail -n +2 {temp_dir}/worker_$i.csv >> {output_file}"
+        )
+        print(f"    done")
+        print(f"  Or just re-run and it will resume from where {output_file} left off.")
+        return
+
+    # Merge temp files in order
     print("\nMerging temp files into main CSV...")
     total_records = 0
     file_exists = os.path.isfile(output_file)
@@ -420,40 +459,26 @@ def scrape(at_once=1000, num_workers=8):
         if not os.path.isfile(temp_file):
             continue
 
-        # Use cat/tail to append efficiently (skip header of temp file)
         if file_exists:
-            result = subprocess.run(
-                f"tail -n +2 '{temp_file}' >> '{output_file}'",
-                shell=True,
-                capture_output=True,
-                text=True,
-            )
+            subprocess.run(f"tail -n +2 '{temp_file}' >> '{output_file}'", shell=True)
         else:
-            result = subprocess.run(
-                f"cp '{temp_file}' '{output_file}'",
-                shell=True,
-                capture_output=True,
-                text=True,
-            )
+            subprocess.run(f"cp '{temp_file}' '{output_file}'", shell=True)
             file_exists = True
 
-        # Count lines added
         count_result = subprocess.run(
             f"wc -l < '{temp_file}'", shell=True, capture_output=True, text=True
         )
-        lines = int(count_result.stdout.strip()) - 1  # minus header
+        lines = int(count_result.stdout.strip()) - 1
         total_records += lines
         print(f"  Merged worker {i}: {lines:,} records")
 
         os.remove(temp_file)
 
-    # Clean up temp dir
     try:
         os.rmdir(temp_dir)
     except OSError:
         pass
 
-    # Clear cursor file on successful completion
     if os.path.isfile(CURSOR_FILE):
         os.remove(CURSOR_FILE)
 
