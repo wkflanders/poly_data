@@ -45,10 +45,8 @@ def tprint(*args, **kwargs):
 
 
 def handle_shutdown(signum, frame):
-    tprint(
-        "\n⚠ Shutdown requested - workers will stop after current batch. Data is safe in temp files."
-    )
-    shutdown_event.set()
+    tprint("\n⚠ Stopping. Data is safe in goldsky/temp_chunks/")
+    os._exit(0)
 
 
 signal.signal(signal.SIGINT, handle_shutdown)
@@ -304,7 +302,7 @@ def scrape_range(start_ts, end_ts, worker_id, temp_dir, at_once=1000):
     return total_records
 
 
-def scrape(at_once=1000, num_workers=8):
+def scrape(at_once=1000, num_workers=16):
     print(f"Query URL: {QUERY_URL}")
     print(f"Runtime timestamp: {RUNTIME_TIMESTAMP}")
     print(f"Workers: {num_workers}")
@@ -313,6 +311,17 @@ def scrape(at_once=1000, num_workers=8):
 
     output_file = "goldsky/orderFilled.csv"
     temp_dir = "goldsky/temp_chunks"
+
+    # Clean up any leftover temp files from a killed run
+    if os.path.isdir(temp_dir):
+        leftover = [f for f in os.listdir(temp_dir) if f.endswith(".csv")]
+        if leftover:
+            print(
+                f"⚠ Cleaning up {len(leftover)} leftover temp files from previous run"
+            )
+            for f in leftover:
+                os.remove(os.path.join(temp_dir, f))
+
     os.makedirs(temp_dir, exist_ok=True)
 
     print(f"Output file: {output_file}")
