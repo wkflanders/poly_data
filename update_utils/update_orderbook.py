@@ -131,7 +131,16 @@ def fetch_market_orderbook(session, market, progress):
 
         # Advance past the last timestamp
         last_ts = int(snapshots[-1]["timestamp"])
+        readable_time = datetime.fromtimestamp(
+            last_ts / 1000, tz=timezone.utc
+        ).strftime("%Y-%m-%d %H:%M:%S UTC")
         start_ts = last_ts + 1
+
+        # Log every page for markets with data
+        if page % 5 == 0:
+            tprint(
+                f"    Market {market_id}: page {page}, {total_new:,} snapshots, last: {readable_time}"
+            )
 
         # Save progress periodically
         if page % 10 == 0:
@@ -166,6 +175,9 @@ def orderbook_worker(markets_chunk, worker_id, progress):
     session = requests.Session()
     total = 0
     done = 0
+    skipped = 0
+    with_data = 0
+    start_time = time.time()
 
     for market in markets_chunk:
         new = fetch_market_orderbook(session, market, progress)
@@ -173,17 +185,25 @@ def orderbook_worker(markets_chunk, worker_id, progress):
         done += 1
 
         if new > 0:
+            with_data += 1
+            status = "CLOSED" if is_closed(market) else "ACTIVE"
             tprint(
-                f"  [Worker {worker_id}] Market {market['id']}: {new:,} snapshots | {done}/{len(markets_chunk)} markets done"
+                f"  [Worker {worker_id}] ✓ Market {market['id']}: {new:,} snapshots [{status}] | {done}/{len(markets_chunk)} ({with_data} with data, {skipped} skipped)"
             )
-        elif done % 200 == 0:
-            tprint(
-                f"  [Worker {worker_id}] Progress: {done}/{len(markets_chunk)} markets checked"
-            )
+        else:
+            skipped += 1
+            if done % 50 == 0:
+                elapsed = time.time() - start_time
+                rate = done / elapsed if elapsed > 0 else 0
+                eta_mins = (len(markets_chunk) - done) / rate / 60 if rate > 0 else 0
+                tprint(
+                    f"  [Worker {worker_id}] Progress: {done:,}/{len(markets_chunk):,} markets | {with_data} with data | {skipped} empty | {rate:.1f} markets/s | ETA: {eta_mins:.0f}min"
+                )
 
+    elapsed = time.time() - start_time
     session.close()
     tprint(
-        f"  [Worker {worker_id}] Finished: {total:,} total snapshots across {len(markets_chunk)} markets"
+        f"  [Worker {worker_id}] Finished: {total:,} snapshots from {with_data} markets ({skipped} empty) in {elapsed / 60:.1f}min"
     )
     return total
 
