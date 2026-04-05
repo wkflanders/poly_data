@@ -10,6 +10,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Earliest available orderbook snapshot data (ms)
 EARLIEST_TS = 1762984233541
+# Same in seconds for date comparison
+EARLIEST_DATE = datetime(2025, 11, 12, 21, 50, 33, tzinfo=timezone.utc)
 
 CLOB_BASE = "https://clob.polymarket.com"
 DATA_DIR = "orderbook_snapshots"
@@ -49,7 +51,7 @@ def save_progress(progress):
 
 
 def load_markets(csv_file="markets.csv"):
-    """Load markets from CSV, return list of dicts with id, token1, closedTime."""
+    """Load markets from CSV, return list of dicts with id, token1, closedTime, createdAt."""
     markets = []
     with open(csv_file, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -62,6 +64,7 @@ def load_markets(csv_file="markets.csv"):
                     "id": row.get("id", "").strip(),
                     "token1": token1,
                     "closedTime": row.get("closedTime", "").strip(),
+                    "createdAt": row.get("createdAt", "").strip(),
                 }
             )
     return markets
@@ -70,6 +73,25 @@ def load_markets(csv_file="markets.csv"):
 def is_closed(market):
     ct = market.get("closedTime", "")
     return bool(ct and ct.lower() not in ("", "none", "false"))
+
+
+def closed_before_data(market):
+    """Check if market was closed before orderbook data started (Nov 12, 2025)."""
+    ct = market.get("closedTime", "")
+    if not ct or ct.lower() in ("", "none", "false"):
+        return False  # not closed = might have data
+    try:
+        # Handle various date formats
+        ct_clean = ct.replace("Z", "+00:00")
+        if "." in ct_clean:
+            dt = datetime.fromisoformat(ct_clean)
+        else:
+            dt = datetime.fromisoformat(ct_clean)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt < EARLIEST_DATE
+    except (ValueError, TypeError):
+        return False  # can't parse = don't skip
 
 
 def fetch_market_orderbook(session, market, progress):
@@ -218,21 +240,28 @@ def update_orderbook(csv_file="markets.csv", num_workers=8):
     os.makedirs(os.path.join(DATA_DIR, "data"), exist_ok=True)
 
     # Load markets and progress
-    print(f"Loading markets from {csv_file}...")
+    print(f"Loading markets from {csv_file}...", flush=True)
     all_markets = load_markets(csv_file)
-    print(f"  Total markets with token1: {len(all_markets):,}")
+    print(f"  Total markets with token1: {len(all_markets):,}", flush=True)
+
+    # Skip markets that closed before orderbook data existed (Nov 12, 2025)
+    pre_filter = len(all_markets)
+    all_markets = [m for m in all_markets if not closed_before_data(m)]
+    skipped_old = pre_filter - len(all_markets)
+    print(f"  Skipped (closed before Nov 2025): {skipped_old:,}", flush=True)
+    print(f"  Candidates: {len(all_markets):,}", flush=True)
 
     progress = load_progress()
     already_done = sum(
         1 for m in all_markets if progress.get(m["token1"], {}).get("complete")
     )
-    print(f"  Already completed: {already_done:,}")
+    print(f"  Already completed: {already_done:,}", flush=True)
 
     # Filter out completed markets
     remaining = [
         m for m in all_markets if not progress.get(m["token1"], {}).get("complete")
     ]
-    print(f"  Remaining: {len(remaining):,}")
+    print(f"  Remaining: {len(remaining):,}", flush=True)
 
     if not remaining:
         print("✅ All markets fully scraped!")
@@ -242,9 +271,11 @@ def update_orderbook(csv_file="markets.csv", num_workers=8):
     closed = [m for m in remaining if is_closed(m)]
     active = [m for m in remaining if not is_closed(m)]
     ordered = closed + active
-    print(f"  Closed markets to scrape: {len(closed):,}")
-    print(f"  Active markets to scrape: {len(active):,}")
-    print(f"\nScraping with {num_workers} workers (Ctrl+C to stop safely)...")
+    print(f"  Closed markets to scrape: {len(closed):,}", flush=True)
+    print(f"  Active markets to scrape: {len(active):,}", flush=True)
+    print(
+        f"\nScraping with {num_workers} workers (Ctrl+C to stop safely)...", flush=True
+    )
 
     # Split markets across workers
     chunks = [[] for _ in range(num_workers)]
