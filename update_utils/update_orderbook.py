@@ -21,7 +21,7 @@ progress_lock = threading.Lock()
 
 def tprint(*args, **kwargs):
     with print_lock:
-        print(*args, **kwargs)
+        print(*args, **kwargs, flush=True)
 
 
 def handle_shutdown(signum, frame):
@@ -178,6 +178,7 @@ def orderbook_worker(markets_chunk, worker_id, progress):
     skipped = 0
     with_data = 0
     start_time = time.time()
+    tprint(f"  [Worker {worker_id}] Starting with {len(markets_chunk):,} markets...")
 
     for market in markets_chunk:
         new = fetch_market_orderbook(session, market, progress)
@@ -192,7 +193,7 @@ def orderbook_worker(markets_chunk, worker_id, progress):
             )
         else:
             skipped += 1
-            if done % 50 == 0:
+            if done == 1 or done % 10 == 0:
                 elapsed = time.time() - start_time
                 rate = done / elapsed if elapsed > 0 else 0
                 eta_mins = (len(markets_chunk) - done) / rate / 60 if rate > 0 else 0
