@@ -1,6 +1,7 @@
 from update_utils.update_markets import update_markets
 from update_utils.update_goldsky import update_goldsky
 from update_utils.process_live import process_live
+from update_utils.update_orderbook import update_orderbook
 
 if __name__ == "__main__":
     print("Updating markets")
@@ -9,3 +10,6 @@ if __name__ == "__main__":
     update_goldsky()
     print("Processing live")
     process_live()
+    print("Updating orderbook")
+    update_orderbook(num_workers=32)
+
