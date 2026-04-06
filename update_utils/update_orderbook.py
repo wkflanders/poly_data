@@ -8,14 +8,13 @@ import requests
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Earliest available orderbook snapshot data (ms)
 EARLIEST_TS = 1762984233541
-# Same in seconds for date comparison
 EARLIEST_DATE = datetime(2025, 11, 12, 21, 50, 33, tzinfo=timezone.utc)
 
 CLOB_BASE = "https://clob.polymarket.com"
 DATA_DIR = "orderbook_snapshots"
 PROGRESS_FILE = os.path.join(DATA_DIR, "progress.json")
+PAGE_SIZE = 1000
 
 print_lock = threading.Lock()
 progress_lock = threading.Lock()
@@ -27,7 +26,7 @@ def tprint(*args, **kwargs):
 
 
 def handle_shutdown(signum, frame):
-    tprint("\n⚠ Stopping. Progress is saved, data is safe. Re-run to continue.")
+    tprint("\n⚠ Stopping. Progress saved, data safe. Re-run to continue.")
     os._exit(0)
 
 
@@ -51,7 +50,6 @@ def save_progress(progress):
 
 
 def load_markets(csv_file="markets.csv"):
-    """Load markets from CSV, return list of dicts with id, token1, closedTime, createdAt."""
     markets = []
     with open(csv_file, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -64,7 +62,6 @@ def load_markets(csv_file="markets.csv"):
                     "id": row.get("id", "").strip(),
                     "token1": token1,
                     "closedTime": row.get("closedTime", "").strip(),
-                    "createdAt": row.get("createdAt", "").strip(),
                 }
             )
     return markets
@@ -76,113 +73,163 @@ def is_closed(market):
 
 
 def closed_before_data(market):
-    """Check if market was closed before orderbook data started (Nov 12, 2025)."""
     ct = market.get("closedTime", "")
     if not ct or ct.lower() in ("", "none", "false"):
-        return False  # not closed = might have data
+        return False
     try:
-        # Handle various date formats
-        ct_clean = ct.replace("Z", "+00:00")
-        if "." in ct_clean:
-            dt = datetime.fromisoformat(ct_clean)
-        else:
-            dt = datetime.fromisoformat(ct_clean)
+        dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt < EARLIEST_DATE
     except (ValueError, TypeError):
-        return False  # can't parse = don't skip
+        return False
+
+
+def fetch_page(session, asset_id, start_ts, market_id):
+    url = f"{CLOB_BASE}/orderbook-history?asset_id={asset_id}&startTs={start_ts}&limit={PAGE_SIZE}"
+
+    for attempt in range(1, 51):
+        try:
+            resp = session.get(url, timeout=30)
+
+            if resp.status_code == 429:
+                wait = min(120, 10 * attempt)
+                tprint(
+                    f"    Market {market_id}: 429 rate limited, waiting {wait}s (attempt {attempt})"
+                )
+                time.sleep(wait)
+                continue
+
+            if resp.status_code >= 500:
+                wait = min(60, 5 * attempt)
+                if attempt % 3 == 0:
+                    tprint(
+                        f"    Market {market_id}: {resp.status_code} server error, retrying in {wait}s (attempt {attempt})"
+                    )
+                time.sleep(wait)
+                continue
+
+            resp.raise_for_status()
+            return resp.json()
+
+        except requests.exceptions.ConnectionError:
+            wait = min(60, 3 * attempt)
+            if attempt % 3 == 0:
+                tprint(
+                    f"    Market {market_id}: connection error, retrying in {wait}s (attempt {attempt})"
+                )
+            time.sleep(wait)
+
+        except requests.exceptions.Timeout:
+            wait = min(60, 5 * attempt)
+            if attempt % 3 == 0:
+                tprint(
+                    f"    Market {market_id}: timeout, retrying in {wait}s (attempt {attempt})"
+                )
+            time.sleep(wait)
+
+        except Exception as e:
+            wait = min(60, 5 * attempt)
+            tprint(
+                f"    Market {market_id}: {e}, retrying in {wait}s (attempt {attempt})"
+            )
+            time.sleep(wait)
+
+    tprint(f"    Market {market_id}: GAVE UP after 50 attempts")
+    return None
 
 
 def fetch_market_orderbook(session, market, progress):
-    """Scrape all orderbook snapshots for a single market. Returns total new snapshots."""
     market_id = market["id"]
     asset_id = market["token1"]
 
-    # Check progress
     with progress_lock:
         state = progress.get(asset_id, {})
 
     if state.get("complete"):
         return 0
 
-    # Resume from last scraped timestamp or start from earliest
     start_ts = state.get("last_ts", EARLIEST_TS)
+    last_hash = state.get("last_hash")
 
     out_file = os.path.join(DATA_DIR, "data", f"{market_id}.jsonl")
     total_new = 0
     page = 0
     mode = "a" if os.path.isfile(out_file) else "w"
+    last_written_hash = last_hash
 
     while True:
-        url = f"{CLOB_BASE}/orderbook-history?asset_id={asset_id}&startTs={start_ts}"
-
-        attempt = 0
-        data = None
-        while True:
-            try:
-                resp = session.get(url, timeout=30)
-                if resp.status_code == 429:
-                    wait = min(60, 5 * (attempt + 1))
-                    time.sleep(wait)
-                    attempt += 1
-                    continue
-                resp.raise_for_status()
-                data = resp.json()
-                break
-            except Exception as e:
-                attempt += 1
-                wait = min(60, 2 * attempt)
-                if attempt % 5 == 0:
-                    tprint(f"    Market {market_id}: retry {attempt}, error: {e}")
-                time.sleep(wait)
+        data = fetch_page(session, asset_id, start_ts, market_id)
+        if data is None:
+            break
 
         snapshots = data.get("data", [])
-
         if not snapshots:
             break
 
-        # Write snapshots to JSONL
+        # Dedupe within batch + skip past resume checkpoint
+        seen = set()
+        unique = []
+        skip_until_past_last = last_hash is not None
+        found_last = False
+
+        for snap in snapshots:
+            h = snap["hash"]
+
+            if skip_until_past_last:
+                if h == last_hash:
+                    found_last = True
+                    continue
+                elif not found_last:
+                    continue
+                else:
+                    skip_until_past_last = False
+
+            if h not in seen:
+                seen.add(h)
+                unique.append(snap)
+
+        if skip_until_past_last and not found_last and last_hash is not None:
+            last_ts = int(snapshots[-1]["timestamp"])
+            start_ts = last_ts
+            last_hash = snapshots[-1]["hash"]
+            continue
+
+        last_hash = None
+
+        if not unique:
+            last_ts = int(snapshots[-1]["timestamp"])
+            start_ts = last_ts
+            continue
+
         with open(out_file, mode) as f:
-            for snap in snapshots:
+            for snap in unique:
                 f.write(json.dumps(snap, separators=(",", ":")) + "\n")
         mode = "a"
 
-        total_new += len(snapshots)
+        total_new += len(unique)
         page += 1
 
-        # Advance past the last timestamp
         last_ts = int(snapshots[-1]["timestamp"])
+        last_written_hash = unique[-1]["hash"]
         readable_time = datetime.fromtimestamp(
             last_ts / 1000, tz=timezone.utc
         ).strftime("%Y-%m-%d %H:%M:%S UTC")
-        start_ts = last_ts + 1
+        start_ts = last_ts
 
-        # Log every page for markets with data
         if page % 5 == 0:
             tprint(
                 f"    Market {market_id}: page {page}, {total_new:,} snapshots, last: {readable_time}"
             )
 
-        # Save progress periodically
-        if page % 10 == 0:
-            with progress_lock:
-                progress[asset_id] = {
-                    "last_ts": start_ts,
-                    "complete": False,
-                    "count": state.get("count", 0) + total_new,
-                }
-            save_progress(progress)
-
-        # If we got fewer than 100, we've reached the end
-        if len(snapshots) < 100:
+        if len(snapshots) < PAGE_SIZE:
             break
 
-    # Mark complete if market is closed (no more data will come)
     closed = is_closed(market)
     with progress_lock:
         progress[asset_id] = {
             "last_ts": start_ts,
+            "last_hash": last_written_hash,
             "complete": closed,
             "count": state.get("count", 0) + total_new,
             "market_id": market_id,
@@ -193,7 +240,6 @@ def fetch_market_orderbook(session, market, progress):
 
 
 def orderbook_worker(markets_chunk, worker_id, progress):
-    """Worker that processes a list of markets sequentially."""
     session = requests.Session()
     total = 0
     done = 0
@@ -220,7 +266,7 @@ def orderbook_worker(markets_chunk, worker_id, progress):
                 rate = done / elapsed if elapsed > 0 else 0
                 eta_mins = (len(markets_chunk) - done) / rate / 60 if rate > 0 else 0
                 tprint(
-                    f"  [Worker {worker_id}] Progress: {done:,}/{len(markets_chunk):,} markets | {with_data} with data | {skipped} empty | {rate:.1f} markets/s | ETA: {eta_mins:.0f}min"
+                    f"  [Worker {worker_id}] Progress: {done:,}/{len(markets_chunk):,} | {with_data} with data | {skipped} empty | {rate:.1f}/s | ETA: {eta_mins:.0f}min"
                 )
 
     elapsed = time.time() - start_time
@@ -231,24 +277,21 @@ def orderbook_worker(markets_chunk, worker_id, progress):
     return total
 
 
-def update_orderbook(csv_file="markets.csv", num_workers=8):
-    """Main entry point."""
-    print("=" * 60)
-    print("📖 Scraping Orderbook History Snapshots")
-    print("=" * 60)
+def update_orderbook(csv_file="markets.csv", num_workers=16):
+    print("=" * 60, flush=True)
+    print("📖 Orderbook History Snapshots", flush=True)
+    print("=" * 60, flush=True)
 
     os.makedirs(os.path.join(DATA_DIR, "data"), exist_ok=True)
 
-    # Load markets and progress
     print(f"Loading markets from {csv_file}...", flush=True)
     all_markets = load_markets(csv_file)
     print(f"  Total markets with token1: {len(all_markets):,}", flush=True)
 
-    # Skip markets that closed before orderbook data existed (Nov 12, 2025)
     pre_filter = len(all_markets)
     all_markets = [m for m in all_markets if not closed_before_data(m)]
     skipped_old = pre_filter - len(all_markets)
-    print(f"  Skipped (closed before Nov 2025): {skipped_old:,}", flush=True)
+    print(f"  Skipped (closed before Nov 12, 2025): {skipped_old:,}", flush=True)
     print(f"  Candidates: {len(all_markets):,}", flush=True)
 
     progress = load_progress()
@@ -257,7 +300,6 @@ def update_orderbook(csv_file="markets.csv", num_workers=8):
     )
     print(f"  Already completed: {already_done:,}", flush=True)
 
-    # Filter out completed markets
     remaining = [
         m for m in all_markets if not progress.get(m["token1"], {}).get("complete")
     ]
@@ -267,22 +309,18 @@ def update_orderbook(csv_file="markets.csv", num_workers=8):
         print("✅ All markets fully scraped!")
         return
 
-    # Sort: closed markets first, then active
     closed = [m for m in remaining if is_closed(m)]
     active = [m for m in remaining if not is_closed(m)]
     ordered = closed + active
-    print(f"  Closed markets to scrape: {len(closed):,}", flush=True)
-    print(f"  Active markets to scrape: {len(active):,}", flush=True)
+    print(f"  Closed: {len(closed):,} | Active: {len(active):,}", flush=True)
     print(
         f"\nScraping with {num_workers} workers (Ctrl+C to stop safely)...", flush=True
     )
 
-    # Split markets across workers
     chunks = [[] for _ in range(num_workers)]
     for i, market in enumerate(ordered):
         chunks[i % num_workers].append(market)
 
-    # Run workers
     grand_total = 0
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = {}
@@ -300,11 +338,11 @@ def update_orderbook(csv_file="markets.csv", num_workers=8):
             except Exception as e:
                 print(f"Worker {worker_id} failed: {e}")
 
-    print(f"\n{'=' * 60}")
-    print(f"✅ Done! Total new snapshots: {grand_total:,}")
-    print(f"   Data: {DATA_DIR}/data/")
-    print(f"   Progress: {PROGRESS_FILE}")
-    print(f"{'=' * 60}")
+    print(f"\n{'=' * 60}", flush=True)
+    print(f"✅ Done! Total new snapshots: {grand_total:,}", flush=True)
+    print(f"   Data: {DATA_DIR}/data/", flush=True)
+    print(f"   Progress: {PROGRESS_FILE}", flush=True)
+    print(f"{'=' * 60}", flush=True)
 
 
 if __name__ == "__main__":
