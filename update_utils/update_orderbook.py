@@ -1,5 +1,6 @@
 import os
 import json
+import gzip
 import signal
 import time
 import csv
@@ -153,6 +154,12 @@ def fetch_market_orderbook(session, market, progress):
     last_hash = state.get("last_hash")
 
     out_file = os.path.join(DATA_DIR, "data", f"{market_id}.jsonl")
+    gz_file = out_file + ".gz"
+
+    # If already compressed, it's done
+    if os.path.isfile(gz_file):
+        return 0
+
     total_new = 0
     page = 0
     mode = "a" if os.path.isfile(out_file) else "w"
@@ -235,6 +242,20 @@ def fetch_market_orderbook(session, market, progress):
             "market_id": market_id,
         }
     save_progress(progress)
+
+    # Compress completed markets to save disk space
+    if closed and total_new > 0 and os.path.isfile(out_file):
+        gz_file = out_file + ".gz"
+        try:
+            with open(out_file, "rb") as f_in, gzip.open(gz_file, "wb") as f_out:
+                while True:
+                    chunk = f_in.read(8 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    f_out.write(chunk)
+            os.remove(out_file)
+        except Exception as e:
+            tprint(f"    Market {market_id}: compression failed: {e}")
 
     return total_new
 
@@ -343,6 +364,48 @@ def update_orderbook(csv_file="markets.csv", num_workers=16):
     print(f"   Data: {DATA_DIR}/data/", flush=True)
     print(f"   Progress: {PROGRESS_FILE}", flush=True)
     print(f"{'=' * 60}", flush=True)
+
+
+def compress_completed():
+    """Compress all completed market JSONL files that haven't been compressed yet."""
+    progress = load_progress()
+    data_dir = os.path.join(DATA_DIR, "data")
+    compressed = 0
+    saved_bytes = 0
+
+    for asset_id, state in progress.items():
+        if not state.get("complete"):
+            continue
+        market_id = state.get("market_id", "")
+        if not market_id:
+            continue
+        jsonl = os.path.join(data_dir, f"{market_id}.jsonl")
+        gz = jsonl + ".gz"
+        if os.path.isfile(jsonl) and not os.path.isfile(gz):
+            orig_size = os.path.getsize(jsonl)
+            try:
+                with open(jsonl, "rb") as f_in, gzip.open(gz, "wb") as f_out:
+                    while True:
+                        chunk = f_in.read(8 * 1024 * 1024)
+                        if not chunk:
+                            break
+                        f_out.write(chunk)
+                gz_size = os.path.getsize(gz)
+                os.remove(jsonl)
+                saved_bytes += orig_size - gz_size
+                compressed += 1
+                if compressed % 100 == 0:
+                    print(
+                        f"  Compressed {compressed} files, saved {saved_bytes / 1024**3:.1f} GB so far...",
+                        flush=True,
+                    )
+            except Exception as e:
+                print(f"  Failed to compress {market_id}: {e}", flush=True)
+
+    print(
+        f"Compressed {compressed} files, saved {saved_bytes / 1024**3:.1f} GB total",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
