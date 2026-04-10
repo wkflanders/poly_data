@@ -11,11 +11,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 EARLIEST_TS = 1762984233541
 EARLIEST_DATE = datetime(2025, 11, 12, 21, 50, 33, tzinfo=timezone.utc)
+NOW_TS = int(time.time() * 1000)
 
 CLOB_BASE = "https://clob.polymarket.com"
 DATA_DIR = "orderbook_snapshots"
 PROGRESS_FILE = os.path.join(DATA_DIR, "progress.json")
 PAGE_SIZE = 1000
+
+# Markets with more than this many snapshots get parallel chunk fetching
+BIG_MARKET_THRESHOLD = 5000
+CHUNKS_PER_BIG_MARKET = 8
 
 print_lock = threading.Lock()
 progress_lock = threading.Lock()
@@ -86,41 +91,40 @@ def closed_before_data(market):
         return False
 
 
-def fetch_page(session, asset_id, start_ts, market_id):
-    url = f"{CLOB_BASE}/orderbook-history?asset_id={asset_id}&startTs={start_ts}&limit={PAGE_SIZE}"
+def fetch_page(session, asset_id, start_ts, market_id, end_ts=None):
+    params = f"asset_id={asset_id}&startTs={start_ts}&limit={PAGE_SIZE}"
+    if end_ts is not None:
+        params += f"&endTs={end_ts}"
+    url = f"{CLOB_BASE}/orderbook-history?{params}"
 
     for attempt in range(1, 51):
         try:
             resp = session.get(url, timeout=30)
-
             if resp.status_code == 429:
                 wait = min(120, 10 * attempt)
-                tprint(
-                    f"    Market {market_id}: 429 rate limited, waiting {wait}s (attempt {attempt})"
-                )
+                if attempt % 3 == 0:
+                    tprint(
+                        f"    Market {market_id}: 429, waiting {wait}s (attempt {attempt})"
+                    )
                 time.sleep(wait)
                 continue
-
             if resp.status_code >= 500:
                 wait = min(60, 5 * attempt)
                 if attempt % 3 == 0:
                     tprint(
-                        f"    Market {market_id}: {resp.status_code} server error, retrying in {wait}s (attempt {attempt})"
+                        f"    Market {market_id}: {resp.status_code}, retrying in {wait}s (attempt {attempt})"
                     )
                 time.sleep(wait)
                 continue
-
             resp.raise_for_status()
             return resp.json()
-
         except requests.exceptions.ConnectionError:
             wait = min(60, 3 * attempt)
             if attempt % 3 == 0:
                 tprint(
-                    f"    Market {market_id}: connection error, retrying in {wait}s (attempt {attempt})"
+                    f"    Market {market_id}: conn error, retrying in {wait}s (attempt {attempt})"
                 )
             time.sleep(wait)
-
         except requests.exceptions.Timeout:
             wait = min(60, 5 * attempt)
             if attempt % 3 == 0:
@@ -128,7 +132,6 @@ def fetch_page(session, asset_id, start_ts, market_id):
                     f"    Market {market_id}: timeout, retrying in {wait}s (attempt {attempt})"
                 )
             time.sleep(wait)
-
         except Exception as e:
             wait = min(60, 5 * attempt)
             tprint(
@@ -138,6 +141,57 @@ def fetch_page(session, asset_id, start_ts, market_id):
 
     tprint(f"    Market {market_id}: GAVE UP after 50 attempts")
     return None
+
+
+def probe_market(session, asset_id, start_ts, market_id):
+    """Quick probe to get total snapshot count."""
+    data = fetch_page(session, asset_id, start_ts, market_id)
+    if data is None:
+        return 0
+    return data.get("count", 0)
+
+
+def fetch_chunk(session, asset_id, start_ts, end_ts, market_id, chunk_file):
+    """Fetch a time range chunk, paginating sequentially. Writes to chunk_file."""
+    total = 0
+    page = 0
+    cursor = start_ts
+    last_hash = None
+
+    while True:
+        data = fetch_page(session, asset_id, cursor, market_id, end_ts=end_ts)
+        if data is None:
+            break
+
+        snapshots = data.get("data", [])
+        if not snapshots:
+            break
+
+        # Dedupe
+        seen = set()
+        unique = []
+        for snap in snapshots:
+            h = snap["hash"]
+            if h not in seen:
+                seen.add(h)
+                unique.append(snap)
+
+        if unique:
+            mode = "a" if os.path.isfile(chunk_file) else "w"
+            with open(chunk_file, mode) as f:
+                for snap in unique:
+                    f.write(json.dumps(snap, separators=(",", ":")) + "\n")
+
+            total += len(unique)
+            last_hash = unique[-1]["hash"]
+
+        page += 1
+        cursor = int(snapshots[-1]["timestamp"])
+
+        if len(snapshots) < PAGE_SIZE:
+            break
+
+    return total, cursor, last_hash
 
 
 def fetch_market_orderbook(session, market, progress):
@@ -156,94 +210,190 @@ def fetch_market_orderbook(session, market, progress):
     out_file = os.path.join(DATA_DIR, "data", f"{market_id}.jsonl")
     gz_file = out_file + ".gz"
 
-    # If already compressed, it's done
     if os.path.isfile(gz_file):
         return 0
 
+    # Probe to get count
+    count = probe_market(session, asset_id, start_ts, market_id)
+
+    if count == 0:
+        # No data
+        closed = is_closed(market)
+        with progress_lock:
+            progress[asset_id] = {
+                "last_ts": start_ts,
+                "last_hash": last_hash,
+                "complete": closed,
+                "count": 0,
+                "market_id": market_id,
+            }
+        save_progress(progress)
+        return 0
+
     total_new = 0
-    page = 0
-    mode = "a" if os.path.isfile(out_file) else "w"
-    last_written_hash = last_hash
 
-    while True:
-        data = fetch_page(session, asset_id, start_ts, market_id)
-        if data is None:
-            break
+    if count <= BIG_MARKET_THRESHOLD:
+        # Small market: sequential fetch (same as before)
+        page = 0
+        mode = "a" if os.path.isfile(out_file) else "w"
+        last_written_hash = last_hash
+        cursor = start_ts
 
-        snapshots = data.get("data", [])
-        if not snapshots:
-            break
+        while True:
+            data = fetch_page(session, asset_id, cursor, market_id)
+            if data is None:
+                break
 
-        # Dedupe within batch + skip past resume checkpoint
-        seen = set()
-        unique = []
-        skip_until_past_last = last_hash is not None
-        found_last = False
+            snapshots = data.get("data", [])
+            if not snapshots:
+                break
 
-        for snap in snapshots:
-            h = snap["hash"]
+            seen = set()
+            unique = []
+            skip_past = last_written_hash is not None
+            found = False
 
-            if skip_until_past_last:
-                if h == last_hash:
-                    found_last = True
-                    continue
-                elif not found_last:
-                    continue
-                else:
-                    skip_until_past_last = False
+            for snap in snapshots:
+                h = snap["hash"]
+                if skip_past:
+                    if h == last_written_hash:
+                        found = True
+                        continue
+                    elif not found:
+                        continue
+                    else:
+                        skip_past = False
+                if h not in seen:
+                    seen.add(h)
+                    unique.append(snap)
 
-            if h not in seen:
-                seen.add(h)
-                unique.append(snap)
+            if skip_past and not found and last_written_hash is not None:
+                cursor = int(snapshots[-1]["timestamp"])
+                last_written_hash = snapshots[-1]["hash"]
+                continue
 
-        if skip_until_past_last and not found_last and last_hash is not None:
-            last_ts = int(snapshots[-1]["timestamp"])
-            start_ts = last_ts
-            last_hash = snapshots[-1]["hash"]
-            continue
+            last_written_hash = None
 
-        last_hash = None
+            if not unique:
+                cursor = int(snapshots[-1]["timestamp"])
+                continue
 
-        if not unique:
-            last_ts = int(snapshots[-1]["timestamp"])
-            start_ts = last_ts
-            continue
+            with open(out_file, mode) as f:
+                for snap in unique:
+                    f.write(json.dumps(snap, separators=(",", ":")) + "\n")
+            mode = "a"
 
-        with open(out_file, mode) as f:
-            for snap in unique:
-                f.write(json.dumps(snap, separators=(",", ":")) + "\n")
-        mode = "a"
+            total_new += len(unique)
+            page += 1
+            cursor = int(snapshots[-1]["timestamp"])
+            last_written_hash = unique[-1]["hash"]
 
-        total_new += len(unique)
-        page += 1
+            if page % 5 == 0:
+                readable = datetime.fromtimestamp(
+                    cursor / 1000, tz=timezone.utc
+                ).strftime("%Y-%m-%d %H:%M:%S UTC")
+                tprint(
+                    f"    Market {market_id}: page {page}, {total_new:,} snapshots, last: {readable}"
+                )
 
-        last_ts = int(snapshots[-1]["timestamp"])
-        last_written_hash = unique[-1]["hash"]
-        readable_time = datetime.fromtimestamp(
-            last_ts / 1000, tz=timezone.utc
-        ).strftime("%Y-%m-%d %H:%M:%S UTC")
-        start_ts = last_ts
+            if len(snapshots) < PAGE_SIZE:
+                break
 
-        if page % 5 == 0:
-            tprint(
-                f"    Market {market_id}: page {page}, {total_new:,} snapshots, last: {readable_time}"
+        final_hash = last_written_hash
+        final_ts = cursor
+
+    else:
+        # Big market: parallel chunk fetching
+        end_ts = NOW_TS
+        time_range = end_ts - start_ts
+        num_chunks = CHUNKS_PER_BIG_MARKET
+
+        chunk_ranges = []
+        for i in range(num_chunks):
+            c_start = start_ts + (i * time_range // num_chunks)
+            c_end = (
+                start_ts + ((i + 1) * time_range // num_chunks)
+                if i < num_chunks - 1
+                else end_ts
             )
+            chunk_ranges.append((c_start, c_end))
 
-        if len(snapshots) < PAGE_SIZE:
-            break
+        chunk_dir = os.path.join(DATA_DIR, "chunks", market_id)
+        os.makedirs(chunk_dir, exist_ok=True)
 
+        tprint(
+            f"    Market {market_id}: {count:,} snapshots, splitting into {num_chunks} parallel chunks"
+        )
+
+        chunk_results = [None] * num_chunks
+
+        with ThreadPoolExecutor(max_workers=num_chunks) as ex:
+            futures = {}
+            for i, (c_start, c_end) in enumerate(chunk_ranges):
+                chunk_file = os.path.join(chunk_dir, f"chunk_{i}.jsonl")
+                future = ex.submit(
+                    fetch_chunk,
+                    session,
+                    asset_id,
+                    c_start,
+                    c_end,
+                    market_id,
+                    chunk_file,
+                )
+                futures[future] = i
+
+            for future in as_completed(futures):
+                i = futures[future]
+                try:
+                    chunk_total, chunk_last_ts, chunk_last_hash = future.result()
+                    chunk_results[i] = (chunk_total, chunk_last_ts, chunk_last_hash)
+                except Exception as e:
+                    tprint(f"    Market {market_id}: chunk {i} failed: {e}")
+                    chunk_results[i] = (0, chunk_ranges[i][1], None)
+
+        # Merge chunks in order
+        mode = "a" if os.path.isfile(out_file) else "w"
+        final_ts = start_ts
+        final_hash = last_hash
+
+        for i in range(num_chunks):
+            chunk_file = os.path.join(chunk_dir, f"chunk_{i}.jsonl")
+            if not os.path.isfile(chunk_file):
+                continue
+
+            with open(chunk_file, "r") as cf, open(out_file, mode) as of:
+                for line in cf:
+                    of.write(line)
+            mode = "a"
+
+            if chunk_results[i]:
+                chunk_total, chunk_last_ts, chunk_last_hash = chunk_results[i]
+                total_new += chunk_total
+                if chunk_last_ts > final_ts:
+                    final_ts = chunk_last_ts
+                    final_hash = chunk_last_hash
+
+            os.remove(chunk_file)
+
+        # Clean up chunk dir
+        try:
+            os.rmdir(chunk_dir)
+        except OSError:
+            pass
+
+    # Save progress
     closed = is_closed(market)
     with progress_lock:
         progress[asset_id] = {
-            "last_ts": start_ts,
-            "last_hash": last_written_hash,
+            "last_ts": final_ts,
+            "last_hash": final_hash,
             "complete": closed,
             "count": state.get("count", 0) + total_new,
             "market_id": market_id,
         }
     save_progress(progress)
 
-    # Compress completed markets to save disk space
+    # Compress completed markets
     if closed and total_new > 0 and os.path.isfile(out_file):
         gz_file = out_file + ".gz"
         try:
@@ -298,12 +448,13 @@ def orderbook_worker(markets_chunk, worker_id, progress):
     return total
 
 
-def update_orderbook(csv_file="markets.csv", num_workers=16):
+def update_orderbook(csv_file="markets.csv", num_workers=200):
     print("=" * 60, flush=True)
     print("📖 Orderbook History Snapshots", flush=True)
     print("=" * 60, flush=True)
 
     os.makedirs(os.path.join(DATA_DIR, "data"), exist_ok=True)
+    os.makedirs(os.path.join(DATA_DIR, "chunks"), exist_ok=True)
 
     print(f"Loading markets from {csv_file}...", flush=True)
     all_markets = load_markets(csv_file)
@@ -334,6 +485,10 @@ def update_orderbook(csv_file="markets.csv", num_workers=16):
     active = [m for m in remaining if not is_closed(m)]
     ordered = closed + active
     print(f"  Closed: {len(closed):,} | Active: {len(active):,}", flush=True)
+    print(
+        f"  Big market threshold: {BIG_MARKET_THRESHOLD:,} snapshots -> {CHUNKS_PER_BIG_MARKET} parallel chunks",
+        flush=True,
+    )
     print(
         f"\nScraping with {num_workers} workers (Ctrl+C to stop safely)...", flush=True
     )
@@ -367,7 +522,6 @@ def update_orderbook(csv_file="markets.csv", num_workers=16):
 
 
 def compress_completed():
-    """Compress all completed market JSONL files that haven't been compressed yet."""
     progress = load_progress()
     data_dir = os.path.join(DATA_DIR, "data")
     compressed = 0
