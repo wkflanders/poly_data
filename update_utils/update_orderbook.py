@@ -16,6 +16,7 @@ NOW_TS = int(time.time() * 1000)
 CLOB_BASE = "https://clob.polymarket.com"
 DATA_DIR = "orderbook_snapshots"
 PROGRESS_FILE = os.path.join(DATA_DIR, "progress.json")
+_active_progress_file = PROGRESS_FILE  # gets overridden per-process
 PAGE_SIZE = 1000
 
 # Markets with more than this many snapshots get parallel chunk fetching
@@ -40,19 +41,21 @@ signal.signal(signal.SIGINT, handle_shutdown)
 signal.signal(signal.SIGTERM, handle_shutdown)
 
 
-def load_progress():
-    if os.path.isfile(PROGRESS_FILE):
-        with open(PROGRESS_FILE, "r") as f:
+def load_progress(path=None):
+    path = path or _active_progress_file
+    if os.path.isfile(path):
+        with open(path, "r") as f:
             return json.load(f)
     return {}
 
 
-def save_progress(progress):
+def save_progress(progress, path=None):
+    path = path or _active_progress_file
     with progress_lock:
-        tmp = PROGRESS_FILE + ".tmp"
+        tmp = path + ".tmp"
         with open(tmp, "w") as f:
             json.dump(progress, f)
-        os.replace(tmp, PROGRESS_FILE)
+        os.replace(tmp, path)
 
 
 def load_markets(csv_file="markets.csv"):
@@ -448,9 +451,18 @@ def orderbook_worker(markets_chunk, worker_id, progress):
     return total
 
 
-def update_orderbook(csv_file="markets.csv", num_workers=200):
+def update_orderbook(
+    csv_file="markets.csv", num_workers=200, market_ids_file=None, progress_file=None
+):
+    if progress_file is None:
+        progress_file = PROGRESS_FILE
+
+    global _active_progress_file
+    _active_progress_file = progress_file
+
     print("=" * 60, flush=True)
     print("📖 Orderbook History Snapshots", flush=True)
+    print(f"   Progress: {progress_file}", flush=True)
     print("=" * 60, flush=True)
 
     os.makedirs(os.path.join(DATA_DIR, "data"), exist_ok=True)
@@ -459,6 +471,16 @@ def update_orderbook(csv_file="markets.csv", num_workers=200):
     print(f"Loading markets from {csv_file}...", flush=True)
     all_markets = load_markets(csv_file)
     print(f"  Total markets with token1: {len(all_markets):,}", flush=True)
+
+    # If a market IDs file is provided, filter to only those markets
+    if market_ids_file:
+        with open(market_ids_file, "r") as f:
+            allowed_ids = set(line.strip() for line in f if line.strip())
+        all_markets = [m for m in all_markets if m["id"] in allowed_ids]
+        print(
+            f"  Filtered to {len(all_markets):,} markets from {market_ids_file}",
+            flush=True,
+        )
 
     pre_filter = len(all_markets)
     all_markets = [m for m in all_markets if not closed_before_data(m)]
