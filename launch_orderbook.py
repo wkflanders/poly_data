@@ -132,28 +132,32 @@ def launch(num_procs, workers):
     # Kill existing session if any
     subprocess.run(f"tmux kill-session -t {SESSION_NAME} 2>/dev/null", shell=True)
 
-    # Build commands — each gets its own progress file
-    commands = []
+    # Write a shell script per process to avoid quote escaping issues
+    scripts = []
     for i in range(num_procs):
         progress_file = os.path.join(PROGRESS_DIR, f"progress_{i}.json")
         # Copy main progress so each process knows what's already done
         if os.path.isfile(MAIN_PROGRESS):
             shutil.copy2(MAIN_PROGRESS, progress_file)
 
-        cmd = (
-            f"cd {os.getcwd()} && ulimit -n 65536 && "
-            f'uv run python -c "'
-            f"from update_utils.update_orderbook import update_orderbook; "
-            f"update_orderbook(num_workers={workers}, "
-            f"market_ids_file='{chunk_files[i]}', "
-            f"progress_file='{progress_file}')"
-            f'"'
-        )
-        commands.append(cmd)
+        script_path = os.path.join(CHUNK_DIR, f"run_{i}.sh")
+        with open(script_path, "w") as f:
+            f.write(f"""#!/bin/bash
+cd {os.getcwd()}
+ulimit -n 65536
+uv run python -c "
+from update_utils.update_orderbook import update_orderbook
+update_orderbook(num_workers={workers}, market_ids_file='{chunk_files[i]}', progress_file='{progress_file}')
+"
+echo "Process {i} finished. Press enter to close."
+read
+""")
+        os.chmod(script_path, 0o755)
+        scripts.append(script_path)
 
     # Create tmux session with first pane
     subprocess.run(
-        f"tmux new-session -d -s {SESSION_NAME} -x 200 -y 50 '{commands[0]}'",
+        f"tmux new-session -d -s {SESSION_NAME} -x 200 -y 50 'bash {scripts[0]}'",
         shell=True,
     )
 
@@ -161,12 +165,12 @@ def launch(num_procs, workers):
     for i in range(1, num_procs):
         if i % 2 == 1:
             subprocess.run(
-                f"tmux split-window -t {SESSION_NAME} -h '{commands[i]}'",
+                f"tmux split-window -t {SESSION_NAME} -h 'bash {scripts[i]}'",
                 shell=True,
             )
         else:
             subprocess.run(
-                f"tmux split-window -t {SESSION_NAME} -v '{commands[i]}'",
+                f"tmux split-window -t {SESSION_NAME} -v 'bash {scripts[i]}'",
                 shell=True,
             )
 
