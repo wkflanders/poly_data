@@ -3,45 +3,134 @@
 Splits remaining markets into N processes across tmux panes.
 
 Usage:
-  python launch_orderbook.py                    # 4 processes, 100 workers each
-  python launch_orderbook.py --processes 8      # 8 processes
-  python launch_orderbook.py --workers 50       # 50 workers per process
-  python launch_orderbook.py --merge            # merge progress files after completion
+  python launch_orderbook.py                    # 8 processes, 50 workers each
+  python launch_orderbook.py --processes 4      # 4 processes
+  python launch_orderbook.py --workers 100      # 100 workers per process
 
-Each process gets its own progress file to avoid corruption.
-Run with --merge after all processes finish to combine them.
+Lifecycle:
+  1. On launch, checks for leftover progress_*.json from a previous run
+  2. Validates them against actual data files on disk
+  3. Merges validated entries into progress.json
+  4. Splits remaining markets into chunks
+  5. Each process gets its own progress_N.json
+  6. Cancel anytime - re-run and it picks up automatically
 """
 
 import json
 import csv
+import gzip
 import os
 import sys
 import subprocess
 import shutil
 from datetime import datetime, timezone
 
-NUM_PROCESSES = 4
-WORKERS_PER_PROCESS = 100
+NUM_PROCESSES = 8
+WORKERS_PER_PROCESS = 50
 SESSION_NAME = "orderbook"
 CHUNK_DIR = "orderbook_chunks"
-PROGRESS_DIR = "orderbook_snapshots"
-MAIN_PROGRESS = os.path.join(PROGRESS_DIR, "progress.json")
+DATA_DIR = "orderbook_snapshots"
+PROGRESS_FILE = os.path.join(DATA_DIR, "progress.json")
+
+
+def validate_and_merge():
+    """Find leftover progress_*.json files, validate against data on disk, merge into progress.json."""
+    progress_files = (
+        sorted(
+            [
+                f
+                for f in os.listdir(DATA_DIR)
+                if f.startswith("progress_") and f.endswith(".json")
+            ]
+        )
+        if os.path.isdir(DATA_DIR)
+        else []
+    )
+
+    if not progress_files:
+        return
+
+    print(f"Found {len(progress_files)} leftover progress files from previous run")
+    print("Validating against data files on disk...")
+
+    # Load main progress
+    main = {}
+    if os.path.isfile(PROGRESS_FILE):
+        with open(PROGRESS_FILE, "r") as f:
+            main = json.load(f)
+
+    data_dir = os.path.join(DATA_DIR, "data")
+    existing_files = set(os.listdir(data_dir)) if os.path.isdir(data_dir) else set()
+
+    merged = 0
+    skipped = 0
+    invalid = 0
+
+    for fname in progress_files:
+        path = os.path.join(DATA_DIR, fname)
+        try:
+            with open(path, "r") as f:
+                chunk_progress = json.load(f)
+        except Exception as e:
+            print(f"  ⚠ Could not read {fname}: {e}")
+            os.remove(path)
+            continue
+
+        for asset_id, state in chunk_progress.items():
+            # Skip if already in main with same or better state
+            if asset_id in main and main[asset_id].get("complete"):
+                skipped += 1
+                continue
+
+            market_id = state.get("market_id", "")
+            if not market_id:
+                skipped += 1
+                continue
+
+            # Validate: if count > 0, data file must exist
+            count = state.get("count", 0)
+            if count > 0:
+                jsonl_exists = f"{market_id}.jsonl" in existing_files
+                gz_exists = f"{market_id}.jsonl.gz" in existing_files
+
+                if not jsonl_exists and not gz_exists:
+                    # Progress claims data but file missing — skip
+                    invalid += 1
+                    continue
+
+                # If gz exists, it's definitely complete
+                if gz_exists:
+                    state["complete"] = True
+
+            main[asset_id] = state
+            merged += 1
+
+        os.remove(path)
+        print(f"  ✓ Processed {fname}: merged entries")
+
+    # Also clean up any .tmp or .lock files
+    for f in os.listdir(DATA_DIR):
+        if f.endswith(".tmp") or f.endswith(".lock"):
+            os.remove(os.path.join(DATA_DIR, f))
+
+    # Save merged progress
+    with open(PROGRESS_FILE, "w") as f:
+        json.dump(main, f)
+
+    complete = sum(1 for v in main.values() if v.get("complete"))
+    print(
+        f"  Merged: {merged:,} | Skipped (already done): {skipped:,} | Invalid (no data file): {invalid:,}"
+    )
+    print(f"  Total tracked: {len(main):,} ({complete:,} complete)")
 
 
 def get_remaining_markets():
     cutoff = datetime(2025, 11, 12, tzinfo=timezone.utc)
 
     progress = {}
-    if os.path.isfile(MAIN_PROGRESS):
-        with open(MAIN_PROGRESS, "r") as f:
+    if os.path.isfile(PROGRESS_FILE):
+        with open(PROGRESS_FILE, "r") as f:
             progress = json.load(f)
-
-    # Also check per-process progress files
-    for f in os.listdir(PROGRESS_DIR) if os.path.isdir(PROGRESS_DIR) else []:
-        if f.startswith("progress_") and f.endswith(".json"):
-            with open(os.path.join(PROGRESS_DIR, f), "r") as fh:
-                p = json.load(fh)
-                progress.update(p)
 
     remaining = []
     for row in csv.DictReader(open("markets.csv")):
@@ -65,45 +154,13 @@ def get_remaining_markets():
     return remaining
 
 
-def merge_progress():
-    """Merge all per-process progress files into the main progress.json."""
-    main = {}
-    if os.path.isfile(MAIN_PROGRESS):
-        with open(MAIN_PROGRESS, "r") as f:
-            main = json.load(f)
-
-    merged = 0
-    for fname in sorted(os.listdir(PROGRESS_DIR)):
-        if not fname.startswith("progress_") or not fname.endswith(".json"):
-            continue
-        path = os.path.join(PROGRESS_DIR, fname)
-        with open(path, "r") as f:
-            chunk_progress = json.load(f)
-        main.update(chunk_progress)
-        merged += len(chunk_progress)
-        os.remove(path)
-        print(f"  Merged {fname}: {len(chunk_progress):,} entries")
-
-    with open(MAIN_PROGRESS, "w") as f:
-        json.dump(main, f)
-
-    complete = sum(1 for v in main.values() if v.get("complete"))
-    print(f"\nMerged {merged:,} entries into {MAIN_PROGRESS}")
-    print(f"Total tracked: {len(main):,} ({complete:,} complete)")
-
-
 def launch(num_procs, workers):
-    # First, merge any leftover per-process progress files from a previous run
-    has_leftover = any(
-        f.startswith("progress_") and f.endswith(".json")
-        for f in (os.listdir(PROGRESS_DIR) if os.path.isdir(PROGRESS_DIR) else [])
-    )
-    if has_leftover:
-        print("Found leftover progress files from previous run, merging first...")
-        merge_progress()
+    # Step 1: validate and merge any leftover progress files
+    validate_and_merge()
 
+    # Step 2: figure out what's left
     remaining = get_remaining_markets()
-    print(f"Remaining markets: {len(remaining):,}")
+    print(f"\nRemaining markets: {len(remaining):,}")
     print(f"Splitting into {num_procs} processes with {workers} workers each")
     print(f"Total concurrent requests: ~{num_procs * workers}")
 
@@ -111,15 +168,16 @@ def launch(num_procs, workers):
         print("Nothing to do!")
         return
 
-    # Clean up old chunk files
-    chunks_dir = "orderbook_snapshots/chunks"
-    if os.path.isdir(chunks_dir):
-        subprocess.run(f"rm -rf {chunks_dir}", shell=True)
+    # Step 3: clean up temp files
+    if os.path.isdir("orderbook_snapshots/chunks"):
+        subprocess.run("rm -rf orderbook_snapshots/chunks", shell=True)
         print("Cleaned up leftover chunk files")
 
-    # Split markets into N chunk files
+    if os.path.isdir(CHUNK_DIR):
+        subprocess.run(f"rm -rf {CHUNK_DIR}", shell=True)
     os.makedirs(CHUNK_DIR, exist_ok=True)
 
+    # Step 4: split markets and create per-process progress files
     chunk_files = []
     for i in range(num_procs):
         chunk = remaining[i::num_procs]
@@ -129,16 +187,16 @@ def launch(num_procs, workers):
         chunk_files.append(chunk_file)
         print(f"  Chunk {i}: {len(chunk):,} markets -> {chunk_file}")
 
-    # Kill existing session if any
+    # Kill existing session
     subprocess.run(f"tmux kill-session -t {SESSION_NAME} 2>/dev/null", shell=True)
 
-    # Write a shell script per process to avoid quote escaping issues
+    # Step 5: write shell scripts and launch tmux panes
     scripts = []
     for i in range(num_procs):
-        progress_file = os.path.join(PROGRESS_DIR, f"progress_{i}.json")
-        # Copy main progress so each process knows what's already done
-        if os.path.isfile(MAIN_PROGRESS):
-            shutil.copy2(MAIN_PROGRESS, progress_file)
+        # Each process gets its own progress file, seeded from main
+        progress_file = os.path.join(DATA_DIR, f"progress_{i}.json")
+        if os.path.isfile(PROGRESS_FILE):
+            shutil.copy2(PROGRESS_FILE, progress_file)
 
         script_path = os.path.join(CHUNK_DIR, f"run_{i}.sh")
         with open(script_path, "w") as f:
@@ -155,13 +213,12 @@ read
         os.chmod(script_path, 0o755)
         scripts.append(script_path)
 
-    # Create tmux session with first pane
+    # Create tmux session
     subprocess.run(
         f"tmux new-session -d -s {SESSION_NAME} -x 200 -y 50 'bash {scripts[0]}'",
         shell=True,
     )
 
-    # Add remaining panes
     for i in range(1, num_procs):
         if i % 2 == 1:
             subprocess.run(
@@ -174,19 +231,19 @@ read
                 shell=True,
             )
 
-    # Tile evenly
     subprocess.run(f"tmux select-layout -t {SESSION_NAME} tiled", shell=True)
 
     print(f"\n✅ Launched {num_procs} processes in tmux session '{SESSION_NAME}'")
     print(f"   Attach:  tmux attach -t {SESSION_NAME}")
     print(f"   Kill:    tmux kill-session -t {SESSION_NAME}")
-    print(f"   Merge:   python launch_orderbook.py --merge")
+    print(
+        f"   Re-run this script anytime — it validates, merges, and continues automatically."
+    )
 
 
 def main():
     num_procs = NUM_PROCESSES
     workers = WORKERS_PER_PROCESS
-    do_merge = False
 
     args = sys.argv[1:]
     i = 0
@@ -197,16 +254,10 @@ def main():
         elif args[i] == "--workers" and i + 1 < len(args):
             workers = int(args[i + 1])
             i += 2
-        elif args[i] == "--merge":
-            do_merge = True
-            i += 1
         else:
             i += 1
 
-    if do_merge:
-        merge_progress()
-    else:
-        launch(num_procs, workers)
+    launch(num_procs, workers)
 
 
 if __name__ == "__main__":

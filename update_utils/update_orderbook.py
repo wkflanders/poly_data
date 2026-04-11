@@ -16,7 +16,7 @@ NOW_TS = int(time.time() * 1000)
 CLOB_BASE = "https://clob.polymarket.com"
 DATA_DIR = "orderbook_snapshots"
 PROGRESS_FILE = os.path.join(DATA_DIR, "progress.json")
-_active_progress_file = PROGRESS_FILE  # gets overridden per-process
+_active_progress_file = PROGRESS_FILE
 PAGE_SIZE = 1000
 
 # Markets with more than this many snapshots get parallel chunk fetching
@@ -454,15 +454,13 @@ def orderbook_worker(markets_chunk, worker_id, progress):
 def update_orderbook(
     csv_file="markets.csv", num_workers=200, market_ids_file=None, progress_file=None
 ):
-    if progress_file is None:
-        progress_file = PROGRESS_FILE
-
-    global _active_progress_file
-    _active_progress_file = progress_file
+    if progress_file:
+        global _active_progress_file
+        _active_progress_file = progress_file
 
     print("=" * 60, flush=True)
     print("📖 Orderbook History Snapshots", flush=True)
-    print(f"   Progress: {progress_file}", flush=True)
+    print(f"   Progress: {_active_progress_file}", flush=True)
     print("=" * 60, flush=True)
 
     os.makedirs(os.path.join(DATA_DIR, "data"), exist_ok=True)
@@ -582,6 +580,73 @@ def compress_completed():
         f"Compressed {compressed} files, saved {saved_bytes / 1024**3:.1f} GB total",
         flush=True,
     )
+
+
+def rebuild_progress():
+    """Rebuild progress.json from actual data files on disk. Use if progress is lost or corrupted."""
+    data_dir = os.path.join(DATA_DIR, "data")
+
+    progress = {}
+    if os.path.isfile(PROGRESS_FILE):
+        with open(PROGRESS_FILE) as f:
+            progress = json.load(f)
+
+    known_markets = {
+        v.get("market_id"): k for k, v in progress.items() if v.get("market_id")
+    }
+
+    files = os.listdir(data_dir) if os.path.isdir(data_dir) else []
+    print(f"Data files on disk: {len(files):,}", flush=True)
+    print(f"Already in progress: {len(progress):,}", flush=True)
+
+    missing = 0
+    errors = 0
+    for fname in files:
+        market_id = fname.replace(".jsonl.gz", "").replace(".jsonl", "")
+        if market_id in known_markets:
+            continue
+
+        fpath = os.path.join(data_dir, fname)
+        last_line = None
+        try:
+            if fname.endswith(".gz"):
+                with gzip.open(fpath, "rt") as f:
+                    for line in f:
+                        last_line = line
+            else:
+                with open(fpath, "r") as f:
+                    for line in f:
+                        last_line = line
+
+            if not last_line:
+                continue
+
+            snap = json.loads(last_line.strip())
+            asset_id = snap.get("asset_id", market_id)
+            is_gz = fname.endswith(".gz")
+
+            progress[asset_id] = {
+                "last_ts": int(snap["timestamp"]),
+                "last_hash": snap.get("hash"),
+                "complete": is_gz,
+                "market_id": market_id,
+                "count": 0,
+            }
+            missing += 1
+        except Exception as e:
+            errors += 1
+            if errors <= 20:
+                print(f"  Error on {fname}: {e}", flush=True)
+
+        if missing % 1000 == 0 and missing > 0:
+            print(f"  Rebuilt {missing:,} entries ({errors} errors)...", flush=True)
+
+    with open(PROGRESS_FILE, "w") as f:
+        json.dump(progress, f)
+
+    complete = sum(1 for v in progress.values() if v.get("complete"))
+    print(f"Rebuilt {missing:,} missing entries ({errors} errors)", flush=True)
+    print(f"Total in progress: {len(progress):,} ({complete:,} complete)", flush=True)
 
 
 if __name__ == "__main__":
