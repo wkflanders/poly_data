@@ -4,25 +4,22 @@ version = "0.1.0"
 description = "A comprehensive data pipeline for fetching, processing, and analyzing Polymarket trading data"
 readme = "README.md"
 requires-python = ">=3.8"
-license = { text = "MIT" }
 authors = [
-    { name = "Warproxxx", email = "" }
+  { name = "Warproxxx" },
+  { name = "wkflanders", email = "wflan@seas.upenn.edu" },
 ]
 
 dependencies = [
-    "pandas>=2.0.0",
-    "polars>=0.19.0",
-    "requests>=2.31.0",
-    "gql[requests]>=3.4.0",
-    "flatten-json>=0.1.13",
+  "flatten-json>=0.1.13",
+  "gql[requests]>=3.4.0",
+  "pandas>=2.0.0",
+  "polars>=0.19.0",
+  "requests>=2.31.0",
+  "zstandard>=0.23.0",
 ]
 
 [project.optional-dependencies]
-dev = [
-    "jupyter>=1.0.0",
-    "notebook>=7.0.0",
-    "ipykernel>=6.25.0",
-]
+dev = ["jupyter>=1.0.0", "notebook>=7.0.0", "ipykernel>=6.25.0"]
 
 [build-system]
 requires = ["hatchling"]

@@ -6,6 +6,7 @@ import time
 import csv
 import threading
 import requests
+import zstandard as zstd
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -19,9 +20,10 @@ PROGRESS_FILE = os.path.join(DATA_DIR, "progress.json")
 _active_progress_file = PROGRESS_FILE
 PAGE_SIZE = 1000
 
-# Markets with more than this many snapshots get parallel chunk fetching
 BIG_MARKET_THRESHOLD = 5000
 CHUNKS_PER_BIG_MARKET = 8
+
+ZSTD_LEVEL = 3  # good balance of speed/ratio
 
 print_lock = threading.Lock()
 progress_lock = threading.Lock()
@@ -147,15 +149,23 @@ def fetch_page(session, asset_id, start_ts, market_id, end_ts=None):
 
 
 def probe_market(session, asset_id, start_ts, market_id):
-    """Quick probe to get total snapshot count."""
     data = fetch_page(session, asset_id, start_ts, market_id)
     if data is None:
         return 0
     return data.get("count", 0)
 
 
+def write_snapshots_zst(zst_path, snapshots):
+    """Append snapshots as a new zstd frame. Multi-frame zst files are valid."""
+    cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL)
+    data = "".join(json.dumps(snap, separators=(",", ":")) + "\n" for snap in snapshots)
+    compressed = cctx.compress(data.encode("utf-8"))
+    with open(zst_path, "ab") as f:
+        f.write(compressed)
+
+
 def fetch_chunk(session, asset_id, start_ts, end_ts, market_id, chunk_file):
-    """Fetch a time range chunk, paginating sequentially. Writes to chunk_file."""
+    """Fetch a time range chunk. Writes compressed."""
     total = 0
     page = 0
     cursor = start_ts
@@ -170,7 +180,6 @@ def fetch_chunk(session, asset_id, start_ts, end_ts, market_id, chunk_file):
         if not snapshots:
             break
 
-        # Dedupe
         seen = set()
         unique = []
         for snap in snapshots:
@@ -180,11 +189,7 @@ def fetch_chunk(session, asset_id, start_ts, end_ts, market_id, chunk_file):
                 unique.append(snap)
 
         if unique:
-            mode = "a" if os.path.isfile(chunk_file) else "w"
-            with open(chunk_file, mode) as f:
-                for snap in unique:
-                    f.write(json.dumps(snap, separators=(",", ":")) + "\n")
-
+            write_snapshots_zst(chunk_file, unique)
             total += len(unique)
             last_hash = unique[-1]["hash"]
 
@@ -195,6 +200,43 @@ def fetch_chunk(session, asset_id, start_ts, end_ts, market_id, chunk_file):
             break
 
     return total, cursor, last_hash
+
+
+def get_out_path(market_id):
+    """Return the .jsonl.zst path. Auto-migrates legacy .jsonl and .jsonl.gz files."""
+    zst_path = os.path.join(DATA_DIR, "data", f"{market_id}.jsonl.zst")
+    gz_path = os.path.join(DATA_DIR, "data", f"{market_id}.jsonl.gz")
+    legacy_path = os.path.join(DATA_DIR, "data", f"{market_id}.jsonl")
+
+    # Already zst — done
+    if os.path.isfile(zst_path):
+        return zst_path
+
+    # Migrate .jsonl -> .zst
+    if os.path.isfile(legacy_path):
+        try:
+            cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL)
+            with open(legacy_path, "rb") as f_in, open(zst_path, "wb") as f_out:
+                cctx.copy_stream(f_in, f_out)
+            os.remove(legacy_path)
+            tprint(f"    Market {market_id}: migrated .jsonl -> .jsonl.zst")
+        except Exception as e:
+            tprint(f"    Market {market_id}: .jsonl migration failed: {e}")
+            return legacy_path
+
+    # Migrate .gz -> .zst
+    if os.path.isfile(gz_path):
+        try:
+            cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL)
+            with gzip.open(gz_path, "rb") as f_in, open(zst_path, "wb") as f_out:
+                cctx.copy_stream(f_in, f_out)
+            os.remove(gz_path)
+            tprint(f"    Market {market_id}: migrated .jsonl.gz -> .jsonl.zst")
+        except Exception as e:
+            tprint(f"    Market {market_id}: .gz migration failed: {e}")
+            return gz_path
+
+    return zst_path
 
 
 def fetch_market_orderbook(session, market, progress):
@@ -210,17 +252,12 @@ def fetch_market_orderbook(session, market, progress):
     start_ts = state.get("last_ts", EARLIEST_TS)
     last_hash = state.get("last_hash")
 
-    out_file = os.path.join(DATA_DIR, "data", f"{market_id}.jsonl")
-    gz_file = out_file + ".gz"
-
-    if os.path.isfile(gz_file):
-        return 0
+    out_file = get_out_path(market_id)
 
     # Probe to get count
     count = probe_market(session, asset_id, start_ts, market_id)
 
     if count == 0:
-        # No data
         closed = is_closed(market)
         with progress_lock:
             progress[asset_id] = {
@@ -236,9 +273,7 @@ def fetch_market_orderbook(session, market, progress):
     total_new = 0
 
     if count <= BIG_MARKET_THRESHOLD:
-        # Small market: sequential fetch (same as before)
         page = 0
-        mode = "a" if os.path.isfile(out_file) else "w"
         last_written_hash = last_hash
         cursor = start_ts
 
@@ -253,38 +288,20 @@ def fetch_market_orderbook(session, market, progress):
 
             seen = set()
             unique = []
-            skip_past = last_written_hash is not None
-            found = False
 
             for snap in snapshots:
                 h = snap["hash"]
-                if skip_past:
-                    if h == last_written_hash:
-                        found = True
-                        continue
-                    elif not found:
-                        continue
-                    else:
-                        skip_past = False
+                if h == last_written_hash:
+                    continue
                 if h not in seen:
                     seen.add(h)
                     unique.append(snap)
-
-            if skip_past and not found and last_written_hash is not None:
-                cursor = int(snapshots[-1]["timestamp"])
-                last_written_hash = snapshots[-1]["hash"]
-                continue
-
-            last_written_hash = None
 
             if not unique:
                 cursor = int(snapshots[-1]["timestamp"])
                 continue
 
-            with open(out_file, mode) as f:
-                for snap in unique:
-                    f.write(json.dumps(snap, separators=(",", ":")) + "\n")
-            mode = "a"
+            write_snapshots_zst(out_file, unique)
 
             total_new += len(unique)
             page += 1
@@ -306,7 +323,6 @@ def fetch_market_orderbook(session, market, progress):
         final_ts = cursor
 
     else:
-        # Big market: parallel chunk fetching
         end_ts = NOW_TS
         time_range = end_ts - start_ts
         num_chunks = CHUNKS_PER_BIG_MARKET
@@ -333,7 +349,7 @@ def fetch_market_orderbook(session, market, progress):
         with ThreadPoolExecutor(max_workers=num_chunks) as ex:
             futures = {}
             for i, (c_start, c_end) in enumerate(chunk_ranges):
-                chunk_file = os.path.join(chunk_dir, f"chunk_{i}.jsonl")
+                chunk_file = os.path.join(chunk_dir, f"chunk_{i}.jsonl.zst")
                 future = ex.submit(
                     fetch_chunk,
                     session,
@@ -354,20 +370,21 @@ def fetch_market_orderbook(session, market, progress):
                     tprint(f"    Market {market_id}: chunk {i} failed: {e}")
                     chunk_results[i] = (0, chunk_ranges[i][1], None)
 
-        # Merge chunks in order
-        mode = "a" if os.path.isfile(out_file) else "w"
+        # Merge chunks in order (zst frames concatenate validly)
         final_ts = start_ts
         final_hash = last_hash
 
         for i in range(num_chunks):
-            chunk_file = os.path.join(chunk_dir, f"chunk_{i}.jsonl")
+            chunk_file = os.path.join(chunk_dir, f"chunk_{i}.jsonl.zst")
             if not os.path.isfile(chunk_file):
                 continue
 
-            with open(chunk_file, "r") as cf, open(out_file, mode) as of:
-                for line in cf:
-                    of.write(line)
-            mode = "a"
+            with open(chunk_file, "rb") as cf, open(out_file, "ab") as of:
+                while True:
+                    block = cf.read(8 * 1024 * 1024)
+                    if not block:
+                        break
+                    of.write(block)
 
             if chunk_results[i]:
                 chunk_total, chunk_last_ts, chunk_last_hash = chunk_results[i]
@@ -378,7 +395,6 @@ def fetch_market_orderbook(session, market, progress):
 
             os.remove(chunk_file)
 
-        # Clean up chunk dir
         try:
             os.rmdir(chunk_dir)
         except OSError:
@@ -395,20 +411,6 @@ def fetch_market_orderbook(session, market, progress):
             "market_id": market_id,
         }
     save_progress(progress)
-
-    # Compress completed markets
-    if closed and total_new > 0 and os.path.isfile(out_file):
-        gz_file = out_file + ".gz"
-        try:
-            with open(out_file, "rb") as f_in, gzip.open(gz_file, "wb") as f_out:
-                while True:
-                    chunk = f_in.read(8 * 1024 * 1024)
-                    if not chunk:
-                        break
-                    f_out.write(chunk)
-            os.remove(out_file)
-        except Exception as e:
-            tprint(f"    Market {market_id}: compression failed: {e}")
 
     return total_new
 
@@ -470,7 +472,6 @@ def update_orderbook(
     all_markets = load_markets(csv_file)
     print(f"  Total markets with token1: {len(all_markets):,}", flush=True)
 
-    # If a market IDs file is provided, filter to only those markets
     if market_ids_file:
         with open(market_ids_file, "r") as f:
             allowed_ids = set(line.strip() for line in f if line.strip())
@@ -541,49 +542,108 @@ def update_orderbook(
     print(f"{'=' * 60}", flush=True)
 
 
-def compress_completed():
-    progress = load_progress()
+def migrate_gz_to_zst(num_workers=8):
+    """Convert all .jsonl.gz files to .jsonl.zst. Parallelized."""
     data_dir = os.path.join(DATA_DIR, "data")
-    compressed = 0
-    saved_bytes = 0
+    gz_files = [f for f in os.listdir(data_dir) if f.endswith(".jsonl.gz")]
 
-    for asset_id, state in progress.items():
-        if not state.get("complete"):
-            continue
-        market_id = state.get("market_id", "")
-        if not market_id:
-            continue
-        jsonl = os.path.join(data_dir, f"{market_id}.jsonl")
-        gz = jsonl + ".gz"
-        if os.path.isfile(jsonl) and not os.path.isfile(gz):
-            orig_size = os.path.getsize(jsonl)
-            try:
-                with open(jsonl, "rb") as f_in, gzip.open(gz, "wb") as f_out:
-                    while True:
-                        chunk = f_in.read(8 * 1024 * 1024)
-                        if not chunk:
-                            break
-                        f_out.write(chunk)
-                gz_size = os.path.getsize(gz)
-                os.remove(jsonl)
-                saved_bytes += orig_size - gz_size
-                compressed += 1
-                if compressed % 100 == 0:
-                    print(
-                        f"  Compressed {compressed} files, saved {saved_bytes / 1024**3:.1f} GB so far...",
-                        flush=True,
-                    )
-            except Exception as e:
-                print(f"  Failed to compress {market_id}: {e}", flush=True)
+    if not gz_files:
+        print("No .gz files to migrate.", flush=True)
+        return
 
     print(
-        f"Compressed {compressed} files, saved {saved_bytes / 1024**3:.1f} GB total",
+        f"Migrating {len(gz_files):,} .gz files to .zst with {num_workers} workers...",
+        flush=True,
+    )
+
+    saved = [0]
+    converted = [0]
+    errors = [0]
+    lock = threading.Lock()
+
+    def convert(fname):
+        gz_path = os.path.join(data_dir, fname)
+        zst_path = os.path.join(data_dir, fname.replace(".jsonl.gz", ".jsonl.zst"))
+        try:
+            cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL)
+            orig = os.path.getsize(gz_path)
+            with gzip.open(gz_path, "rb") as f_in, open(zst_path, "wb") as f_out:
+                cctx.copy_stream(f_in, f_out)
+            new_size = os.path.getsize(zst_path)
+            os.remove(gz_path)
+            with lock:
+                saved[0] += orig - new_size
+                converted[0] += 1
+                if converted[0] % 500 == 0:
+                    tprint(
+                        f"  {converted[0]:,}/{len(gz_files):,} converted, saved {saved[0] / 1024**3:.1f} GB..."
+                    )
+        except Exception as e:
+            with lock:
+                errors[0] += 1
+                if errors[0] <= 10:
+                    tprint(f"  Failed {fname}: {e}")
+
+    with ThreadPoolExecutor(max_workers=num_workers) as ex:
+        list(ex.map(convert, gz_files))
+
+    print(
+        f"Done. Converted {converted[0]:,} files, saved {saved[0] / 1024**3:.1f} GB, {errors[0]} errors",
         flush=True,
     )
 
 
+def migrate_gz_to_zst_from_dir(source_dir, num_workers=8):
+    """Convert .gz files from an external directory (e.g. /home/william/orderbook_gz) to .zst in data dir."""
+    data_dir = os.path.join(DATA_DIR, "data")
+    gz_files = [f for f in os.listdir(source_dir) if f.endswith(".jsonl.gz")]
+
+    if not gz_files:
+        print(f"No .gz files in {source_dir}.", flush=True)
+        return
+
+    print(
+        f"Migrating {len(gz_files):,} .gz files from {source_dir} to .zst in {data_dir}...",
+        flush=True,
+    )
+
+    converted = [0]
+    errors = [0]
+    lock = threading.Lock()
+
+    def convert(fname):
+        gz_path = os.path.join(source_dir, fname)
+        zst_path = os.path.join(data_dir, fname.replace(".jsonl.gz", ".jsonl.zst"))
+        if os.path.isfile(zst_path):
+            os.remove(gz_path)
+            with lock:
+                converted[0] += 1
+            return
+        try:
+            cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL)
+            with gzip.open(gz_path, "rb") as f_in, open(zst_path, "wb") as f_out:
+                cctx.copy_stream(f_in, f_out)
+            os.remove(gz_path)
+            with lock:
+                converted[0] += 1
+                if converted[0] % 500 == 0:
+                    tprint(f"  {converted[0]:,}/{len(gz_files):,} converted...")
+        except Exception as e:
+            with lock:
+                errors[0] += 1
+                if errors[0] <= 10:
+                    tprint(f"  Failed {fname}: {e}")
+
+    with ThreadPoolExecutor(max_workers=num_workers) as ex:
+        list(ex.map(convert, gz_files))
+
+    print(f"Done. Converted {converted[0]:,} files, {errors[0]} errors", flush=True)
+
+
 def rebuild_progress():
-    """Rebuild progress.json from actual data files on disk. Use if progress is lost or corrupted."""
+    """Rebuild progress.json from actual data files on disk."""
+    import subprocess
+
     data_dir = os.path.join(DATA_DIR, "data")
 
     progress = {}
@@ -602,33 +662,49 @@ def rebuild_progress():
     missing = 0
     errors = 0
     for fname in files:
-        market_id = fname.replace(".jsonl.gz", "").replace(".jsonl", "")
+        market_id = (
+            fname.replace(".jsonl.zst", "")
+            .replace(".jsonl.gz", "")
+            .replace(".jsonl", "")
+        )
         if market_id in known_markets:
             continue
 
         fpath = os.path.join(data_dir, fname)
         last_line = None
         try:
-            if fname.endswith(".gz"):
-                with gzip.open(fpath, "rt") as f:
-                    for line in f:
-                        last_line = line
+            if fname.endswith(".zst"):
+                dctx = zstd.ZstdDecompressor()
+                with open(fpath, "rb") as f:
+                    reader = dctx.stream_reader(f)
+                    text = reader.read().decode("utf-8")
+                    lines = text.strip().split("\n")
+                    last_line = lines[-1] if lines else None
+            elif fname.endswith(".gz"):
+                result = subprocess.run(
+                    ["bash", "-c", f"zcat '{fpath}' | tail -1"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                last_line = result.stdout.strip()
             else:
-                with open(fpath, "r") as f:
-                    for line in f:
-                        last_line = line
+                result = subprocess.run(
+                    ["tail", "-1", fpath], capture_output=True, text=True, timeout=5
+                )
+                last_line = result.stdout.strip()
 
             if not last_line:
                 continue
 
-            snap = json.loads(last_line.strip())
+            snap = json.loads(last_line)
             asset_id = snap.get("asset_id", market_id)
-            is_gz = fname.endswith(".gz")
+            is_compressed = fname.endswith(".zst") or fname.endswith(".gz")
 
             progress[asset_id] = {
                 "last_ts": int(snap["timestamp"]),
                 "last_hash": snap.get("hash"),
-                "complete": is_gz,
+                "complete": is_compressed,
                 "market_id": market_id,
                 "count": 0,
             }
