@@ -20,7 +20,7 @@ PROGRESS_FILE = os.path.join(DATA_DIR, "progress.json")
 _active_progress_file = PROGRESS_FILE
 PAGE_SIZE = 1000
 
-BIG_MARKET_THRESHOLD = 5000
+BIG_MARKET_THRESHOLD = 999999999
 CHUNKS_PER_BIG_MARKET = 8
 
 ZSTD_LEVEL = 3  # good balance of speed/ratio
