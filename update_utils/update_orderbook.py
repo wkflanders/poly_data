@@ -169,6 +169,58 @@ def fetch_chunk(session, asset_id, start_ts, end_ts, market_id, chunk_file):
     total = 0
     page = 0
     cursor = start_ts
+    prev_cursor = None
+    written_hashes = set()
+
+    while True:
+        data = fetch_page(session, asset_id, cursor, market_id, end_ts=end_ts)
+        if data is None:
+            break
+
+        snapshots = data.get("data", [])
+        if not snapshots:
+            break
+
+        new_cursor = int(snapshots[-1]["timestamp"])
+
+        unique = []
+        for snap in snapshots:
+            h = snap["hash"]
+            if h not in written_hashes:
+                written_hashes.add(h)
+                unique.append(snap)
+
+        if not unique:
+            # No new data — if cursor isn't moving we're done
+            if new_cursor == cursor:
+                break
+            prev_cursor = cursor
+            cursor = new_cursor
+            if len(snapshots) < PAGE_SIZE:
+                break
+            continue
+
+        write_snapshots_zst(chunk_file, unique)
+        total += len(unique)
+        page += 1
+        prev_cursor = cursor
+        cursor = new_cursor
+
+        if len(snapshots) < PAGE_SIZE:
+            break
+
+    return (
+        total,
+        cursor,
+        written_hashes and max(written_hashes, key=lambda h: h) or None,
+    )
+
+
+def fetch_chunk(session, asset_id, start_ts, end_ts, market_id, chunk_file):
+    """Fetch a time range chunk. Writes compressed."""
+    total = 0
+    cursor = start_ts
+    written_hashes = set()
     last_hash = None
 
     while True:
@@ -180,12 +232,13 @@ def fetch_chunk(session, asset_id, start_ts, end_ts, market_id, chunk_file):
         if not snapshots:
             break
 
-        seen = set()
+        new_cursor = int(snapshots[-1]["timestamp"])
+
         unique = []
         for snap in snapshots:
             h = snap["hash"]
-            if h not in seen:
-                seen.add(h)
+            if h not in written_hashes:
+                written_hashes.add(h)
                 unique.append(snap)
 
         if unique:
@@ -193,8 +246,11 @@ def fetch_chunk(session, asset_id, start_ts, end_ts, market_id, chunk_file):
             total += len(unique)
             last_hash = unique[-1]["hash"]
 
-        page += 1
-        cursor = int(snapshots[-1]["timestamp"])
+        # If cursor didn't advance, we're stuck — stop
+        if new_cursor == cursor:
+            break
+
+        cursor = new_cursor
 
         if len(snapshots) < PAGE_SIZE:
             break
@@ -274,8 +330,13 @@ def fetch_market_orderbook(session, market, progress):
 
     if count <= BIG_MARKET_THRESHOLD:
         page = 0
-        last_written_hash = last_hash
         cursor = start_ts
+        # Track all hashes written this session so dedup works across pages,
+        # not just against the single last-written hash.
+        written_hashes = set()
+        if last_hash:
+            written_hashes.add(last_hash)
+        last_written_hash = last_hash
 
         while True:
             data = fetch_page(session, asset_id, cursor, market_id)
@@ -286,27 +347,34 @@ def fetch_market_orderbook(session, market, progress):
             if not snapshots:
                 break
 
-            seen = set()
-            unique = []
+            new_cursor = int(snapshots[-1]["timestamp"])
 
+            unique = []
             for snap in snapshots:
                 h = snap["hash"]
-                if h == last_written_hash:
-                    continue
-                if h not in seen:
-                    seen.add(h)
+                if h not in written_hashes:
+                    written_hashes.add(h)
                     unique.append(snap)
 
             if not unique:
-                cursor = int(snapshots[-1]["timestamp"])
+                # No new records on this page. If cursor isn't advancing, we're done.
+                if new_cursor == cursor:
+                    break
+                cursor = new_cursor
+                if len(snapshots) < PAGE_SIZE:
+                    break
                 continue
 
             write_snapshots_zst(out_file, unique)
-
             total_new += len(unique)
             page += 1
-            cursor = int(snapshots[-1]["timestamp"])
             last_written_hash = unique[-1]["hash"]
+
+            # If cursor didn't advance, stop — fetching again would return the same data.
+            if new_cursor == cursor:
+                break
+
+            cursor = new_cursor
 
             if page % 5 == 0:
                 readable = datetime.fromtimestamp(
