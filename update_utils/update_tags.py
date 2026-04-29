@@ -2,120 +2,159 @@ import requests
 import csv
 import os
 import time
+import json
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 MARKETS_CSV = "markets.csv"
+CATEGORY_FILE = "category_lookup.json"
+PROGRESS_FILE = "category_progress.json"
+
+SKIP_TAGS = {"all", "games"}  # useless tags to ignore
 
 
-def fetch_all_tags():
-    """Fetch all tags from GET /tags."""
-    while True:
-        try:
-            resp = requests.get(f"{GAMMA_BASE}/tags", timeout=30)
-            if resp.status_code == 429:
-                print("Rate limited, waiting 10s...")
-                time.sleep(10)
-                continue
-            resp.raise_for_status()
-            return resp.json()
-        except requests.exceptions.RequestException as e:
-            print(f"Error fetching tags: {e}, retrying in 5s...")
-            time.sleep(5)
+def load_progress():
+    progress = {"offset": 0}
+    if os.path.isfile(PROGRESS_FILE):
+        with open(PROGRESS_FILE) as f:
+            progress = json.load(f)
+    lookup = {}
+    if os.path.isfile(CATEGORY_FILE):
+        with open(CATEGORY_FILE) as f:
+            lookup = json.load(f)
+    return progress["offset"], lookup
 
 
-def fetch_events_by_tag(tag_id, batch_size=500):
-    """Fetch all events for a tag_id using GET /events?tag_id=..."""
-    offset = 0
-    events = []
-    while True:
-        params = {
-            "tag_id": tag_id,
-            "limit": batch_size,
-            "offset": offset,
-            "related_tags": "true",
-        }
-        try:
-            resp = requests.get(f"{GAMMA_BASE}/events", params=params, timeout=30)
-            if resp.status_code == 429:
-                time.sleep(10)
-                continue
-            if resp.status_code == 500:
+def save_progress(offset, lookup):
+    tmp = PROGRESS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"offset": offset}, f)
+    os.replace(tmp, PROGRESS_FILE)
+    tmp = CATEGORY_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(lookup, f)
+    os.replace(tmp, CATEGORY_FILE)
+
+
+def extract_tags(event):
+    # Prefer explicit category field
+    category = event.get("category", "")
+    if category:
+        return category
+
+    # Fall back to tags array, filtering noise
+    tags = event.get("tags") or []
+    labels = []
+    for t in tags:
+        label = t.get("label") or t.get("slug", "")
+        if label and label.lower() not in SKIP_TAGS:
+            labels.append(label)
+    return "|".join(labels)
+
+
+def fetch_categories(batch_size=500):
+    offset, lookup = load_progress()
+
+    if offset > 0:
+        print(f"Resuming from offset {offset:,} ({len(lookup):,} markets already tagged)")
+    else:
+        print("Starting fresh...")
+
+    try:
+        while True:
+            params = {
+                "order": "createdAt",
+                "ascending": "true",
+                "limit": batch_size,
+                "offset": offset,
+            }
+            try:
+                resp = requests.get(f"{GAMMA_BASE}/events", params=params, timeout=30)
+                if resp.status_code == 429:
+                    print("Rate limited, waiting 10s...")
+                    time.sleep(10)
+                    continue
+                if resp.status_code == 500:
+                    time.sleep(5)
+                    continue
+                resp.raise_for_status()
+                batch = resp.json()
+            except requests.exceptions.RequestException as e:
+                print(f"Network error: {e}, retrying in 5s...")
                 time.sleep(5)
                 continue
-            resp.raise_for_status()
-            batch = resp.json()
+
             if not batch:
                 break
-            events.extend(batch)
+
+            for event in batch:
+                tags_str = extract_tags(event)
+                for market in event.get("markets", []):
+                    mid = str(market.get("id", "")).strip()
+                    if mid and tags_str:
+                        lookup[mid] = tags_str
+
             offset += len(batch)
+            save_progress(offset, lookup)
+            print(f"  {offset:,} events, {len(lookup):,} markets tagged")
+
             if len(batch) < batch_size:
                 break
-        except requests.exceptions.RequestException as e:
-            print(f"Error: {e}, retrying...")
-            time.sleep(5)
-    return events
+
+    except KeyboardInterrupt:
+        print(f"\nStopped at offset {offset:,}. Re-run to continue.")
+        return False
+
+    return True
 
 
-def update_tags(markets_csv=MARKETS_CSV):
-    """
-    Fetch all tags from /tags, then for each tag fetch all events under it
-    via /events?tag_id=..., extract the markets from each event, and write
-    a 'tags' column back into markets.csv.
-    """
-    print("Fetching tags from GET /tags...")
-    tags = fetch_all_tags()
-    print(f"Found {len(tags)} tags:")
-    for t in tags:
-        print(f"  id={t.get('id')}  label={t.get('label') or t.get('slug')}")
-
-    # market id (str) -> set of tag labels
-    market_id_to_tags = {}
-
-    for tag in tags:
-        tag_id = tag.get("id")
-        tag_label = tag.get("label") or tag.get("slug") or tag.get("name", "")
-        if not tag_id or not tag_label:
-            continue
-
-        print(f"Fetching events for tag '{tag_label}'...")
-        events = fetch_events_by_tag(tag_id)
-        print(f"  {len(events)} events")
-
-        for event in events:
-            for market in event.get("markets", []):
-                mid = str(market.get("id", ""))
-                if not mid:
-                    continue
-                if mid not in market_id_to_tags:
-                    market_id_to_tags[mid] = set()
-                market_id_to_tags[mid].add(tag_label)
-
-    print(f"\nTagged {len(market_id_to_tags):,} markets total")
-
-    # Update markets.csv
-    if not os.path.exists(markets_csv):
-        print(f"{markets_csv} not found")
+def apply_categories(markets_csv=MARKETS_CSV):
+    if not os.path.isfile(CATEGORY_FILE):
+        print("No category lookup found — run fetch_categories first")
         return
 
-    print(f"Updating {markets_csv}...")
-    rows = []
-    with open(markets_csv, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
+    print("Loading category lookup...")
+    with open(CATEGORY_FILE) as f:
+        lookup = json.load(f)
+    print(f"  {len(lookup):,} markets in lookup")
+
+    tmp_csv = markets_csv + ".tmp"
+    print(f"Streaming {markets_csv} -> adding tags column...")
+
+    tagged = 0
+    total = 0
+    with open(markets_csv, "r", encoding="utf-8") as fin, \
+         open(tmp_csv, "w", newline="", encoding="utf-8") as fout:
+
+        reader = csv.DictReader(fin)
         fieldnames = list(reader.fieldnames or [])
         if "tags" not in fieldnames:
             fieldnames.append("tags")
+
+        writer = csv.DictWriter(fout, fieldnames=fieldnames)
+        writer.writeheader()
+
         for row in reader:
             mid = str(row.get("id", "")).strip()
-            row["tags"] = "|".join(sorted(market_id_to_tags.get(mid, [])))
-            rows.append(row)
+            row["tags"] = lookup.get(mid, "")
+            if row["tags"]:
+                tagged += 1
+            writer.writerow(row)
+            total += 1
+            if total % 100000 == 0:
+                print(f"  {total:,} rows written...")
 
-    with open(markets_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+    os.replace(tmp_csv, markets_csv)
+    print(f"Done. {tagged:,}/{total:,} markets have tags")
 
-    tagged = sum(1 for r in rows if r.get("tags"))
-    print(f"Done. {tagged:,}/{len(rows):,} markets have tags")
+    os.remove(CATEGORY_FILE)
+    if os.path.isfile(PROGRESS_FILE):
+        os.remove(PROGRESS_FILE)
+
+
+def update_tags(markets_csv=MARKETS_CSV):
+    done = fetch_categories()
+    if done:
+        apply_categories(markets_csv)
 
 
 if __name__ == "__main__":
