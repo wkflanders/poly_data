@@ -10,9 +10,6 @@ from typing import List, Dict
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 REPAIR_WORKERS = 32
-EMPTY_RETRY_ATTEMPTS = (
-    3  # how many times to re-confirm "no more data" before quitting phase 1
-)
 
 
 def count_csv_lines(csv_filename: str) -> int:
@@ -28,34 +25,8 @@ def count_csv_lines(csv_filename: str) -> int:
         return 0
 
 
-def _cursor_path(csv_filename: str) -> str:
-    return csv_filename + ".cursor"
-
-
 def _bad_log_path(csv_filename: str) -> str:
     return csv_filename + ".bad_rows.log"
-
-
-def _load_cursor(csv_filename: str):
-    p = _cursor_path(csv_filename)
-    if not os.path.isfile(p):
-        return None
-    with open(p, "r", encoding="utf-8") as f:
-        return f.read().strip() or None
-
-
-def _save_cursor(csv_filename: str, cursor):
-    p = _cursor_path(csv_filename)
-    tmp = p + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(cursor or "")
-    os.replace(tmp, p)
-
-
-def _clear_cursor(csv_filename: str):
-    p = _cursor_path(csv_filename)
-    if os.path.isfile(p):
-        os.remove(p)
 
 
 def _is_blank(v) -> bool:
@@ -203,109 +174,104 @@ HEADERS = [
 ]
 
 
-def _phase1_keyset_fetch(csv_filename: str, batch_size: int):
+def _phase1_subfetch(csv_filename: str, batch_size: int, closed_flag: bool):
+    """One sub-pass of phase 1: fetches either all open or all closed markets."""
     base_url = f"{GAMMA_BASE}/markets/keyset"
+    label = "closed" if closed_flag else "open"
+    cursor_file = csv_filename + f".cursor.{label}"
+    done_marker = csv_filename + f".done.{label}"
 
-    existing_lines = count_csv_lines(csv_filename)
-    after_cursor = _load_cursor(csv_filename)
-    file_exists = os.path.exists(csv_filename) and existing_lines > 0
-
-    if file_exists and after_cursor:
-        print(f"Phase 1: resuming from saved cursor ({existing_lines} existing rows)")
-        mode = "a"
-    elif file_exists and not after_cursor:
-        print(f"Phase 1: file exists ({existing_lines} rows), no cursor — skipping")
+    if os.path.isfile(done_marker):
+        print(f"Phase 1 [{label}]: already complete, skipping.")
         return
+
+    after_cursor = None
+    if os.path.isfile(cursor_file):
+        with open(cursor_file) as f:
+            after_cursor = f.read().strip() or None
+        print(f"Phase 1 [{label}]: resuming from saved cursor.")
     else:
-        print(f"Phase 1: creating new CSV {csv_filename}")
-        mode = "w"
+        print(f"Phase 1 [{label}]: starting fresh.")
 
     session = requests.Session()
     total_fetched = 0
-    empty_streak = 0  # consecutive empty / no-cursor responses
 
-    with open(csv_filename, mode, newline="", encoding="utf-8") as csvfile:
+    with open(csv_filename, "a", newline="", encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
-        if mode == "w":
-            writer.writerow(HEADERS)
 
         while True:
-            params = {"order": "createdAt", "ascending": "true", "limit": batch_size}
+            # NOTE: don't pass `order=createdAt` — server 500s when combined with `closed=true`.
+            # Default sort (by id) is fine and gives full historical coverage.
+            params = {"limit": batch_size, "closed": "true" if closed_flag else "false"}
             if after_cursor:
                 params["after_cursor"] = after_cursor
 
-            print(f"  Fetching batch (cursor={after_cursor!r})...")
+            print(f"  [{label}] Fetching batch (cursor={after_cursor!r})...")
             resp = _request_with_retry(session, base_url, params=params)
             if resp is None:
-                print("  Giving up after repeated request failures.")
+                print(f"  [{label}] Giving up after request failures.")
                 break
             if resp.status_code != 200:
-                print(f"  API error {resp.status_code}: {resp.text[:300]}")
+                print(f"  [{label}] API error {resp.status_code}: {resp.text[:300]}")
                 time.sleep(3)
                 continue
 
             try:
                 payload = resp.json()
             except Exception as e:
-                print(f"  JSON parse error: {e}")
+                print(f"  [{label}] JSON parse error: {e}")
                 time.sleep(3)
                 continue
 
             markets = payload.get("markets", [])
             next_cursor = payload.get("next_cursor")
 
-            # Empty results: could be transient. Retry up to EMPTY_RETRY_ATTEMPTS times
-            # before declaring really done. Don't clear cursor in between.
-            if not markets:
-                empty_streak += 1
-                if empty_streak >= EMPTY_RETRY_ATTEMPTS:
-                    print(
-                        f"  {empty_streak} consecutive empty responses — confirmed end of data."
-                    )
-                    _clear_cursor(csv_filename)
-                    break
-                wait = 10 * empty_streak
-                print(
-                    f"  Empty markets array (streak {empty_streak}/{EMPTY_RETRY_ATTEMPTS}). Sleeping {wait}s and retrying same cursor."
-                )
-                time.sleep(wait)
-                continue
-
-            empty_streak = 0  # got real data, reset
-
+            # Write whatever markets came back.
             for market in markets:
                 try:
                     writer.writerow(_build_row(market))
                     total_fetched += 1
                 except Exception as e:
                     print(
-                        f"  Error building row for market {market.get('id', '?')}: {e}"
+                        f"  [{label}] Error building row for market {market.get('id', '?')}: {e}"
                     )
-
             csvfile.flush()
 
-            # No next_cursor: per spec, last page. Same retry-to-confirm logic.
-            if not next_cursor:
-                empty_streak += 1
-                if empty_streak >= EMPTY_RETRY_ATTEMPTS:
-                    print(
-                        f"  {empty_streak} consecutive responses without next_cursor — confirmed end."
-                    )
-                    _clear_cursor(csv_filename)
-                    break
-                wait = 10 * empty_streak
-                print(
-                    f"  No next_cursor returned (streak {empty_streak}/{EMPTY_RETRY_ATTEMPTS}). Sleeping {wait}s and retrying same cursor."
-                )
-                time.sleep(wait)
-                continue
+            if markets:
+                print(f"  [{label}] +{len(markets)} markets (total: {total_fetched})")
 
-            _save_cursor(csv_filename, next_cursor)
-            print(f"  +{len(markets)} markets (total new: {total_fetched})")
+            # No next_cursor = last page per spec. Done.
+            if not next_cursor:
+                print(
+                    f"  [{label}] No next_cursor — reached end. Sub-pass total: {total_fetched}"
+                )
+                if os.path.isfile(cursor_file):
+                    os.remove(cursor_file)
+                with open(done_marker, "w") as f:
+                    f.write("done\n")
+                break
+
+            # Save cursor and advance.
+            tmp = cursor_file + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(next_cursor)
+            os.replace(tmp, cursor_file)
             after_cursor = next_cursor
 
     session.close()
-    print(f"Phase 1 done. Wrote {total_fetched} new rows.")
+
+
+def _phase1_keyset_fetch(csv_filename: str, batch_size: int):
+    """Phase 1: fetch all markets via two sub-passes (open + closed)."""
+    file_exists = os.path.exists(csv_filename) and count_csv_lines(csv_filename) > 0
+
+    if not file_exists:
+        print(f"Phase 1: creating new CSV {csv_filename}")
+        with open(csv_filename, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(HEADERS)
+
+    for closed_flag in (False, True):
+        _phase1_subfetch(csv_filename, batch_size, closed_flag)
 
 
 def _phase2_repair(csv_filename: str, what: str):
