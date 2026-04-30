@@ -3,14 +3,19 @@ import csv
 import json
 import os
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict
 
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
+REPAIR_WORKERS = 32
+EMPTY_RETRY_ATTEMPTS = (
+    3  # how many times to re-confirm "no more data" before quitting phase 1
+)
 
 
 def count_csv_lines(csv_filename: str) -> int:
-    """Count the number of data lines in CSV (excluding header)"""
     if not os.path.exists(csv_filename):
         return 0
     try:
@@ -54,12 +59,10 @@ def _clear_cursor(csv_filename: str):
 
 
 def _is_blank(v) -> bool:
-    """null or empty string both count as missing."""
     return v is None or v == ""
 
 
 def _parse_str_list(v):
-    """Polymarket returns outcomes/clobTokenIds as a JSON-encoded string. Return list or None."""
     if v is None or v == "":
         return None
     if isinstance(v, list):
@@ -74,7 +77,6 @@ def _parse_str_list(v):
 
 
 def _format_tags(market: dict) -> str:
-    """Pipe-joined tag labels from /markets endpoint when include_tag=true."""
     tags = market.get("tags") or []
     labels = []
     for t in tags:
@@ -85,8 +87,6 @@ def _format_tags(market: dict) -> str:
 
 
 def _build_row(market: dict) -> List:
-    """Build a CSV row from a market dict. Preserves null/empty as empty strings —
-    caller is responsible for detecting and re-fetching."""
     outcomes = _parse_str_list(market.get("outcomes"))
     clob_tokens = _parse_str_list(market.get("clobTokenIds"))
 
@@ -127,7 +127,6 @@ def _build_row(market: dict) -> List:
     ]
 
 
-# Indices into the row list (kept in sync with _build_row / headers)
 COL_ID = 1
 COL_ANSWER1 = 3
 COL_ANSWER2 = 4
@@ -138,7 +137,6 @@ COL_TAGS = 14
 
 
 def _row_is_missing_critical(row: List) -> List[str]:
-    """Return list of missing-field names. Empty list = row is fine."""
     missing = []
     if _is_blank(row[COL_ANSWER1]) and _is_blank(row[COL_ANSWER2]):
         missing.append("outcomes")
@@ -150,7 +148,6 @@ def _row_is_missing_critical(row: List) -> List[str]:
 
 
 def _request_with_retry(session, url, params=None, max_attempts=10):
-    """GET with retry on 429/500/503/network errors. Returns response or None."""
     for attempt in range(1, max_attempts + 1):
         try:
             resp = session.get(url, params=params, timeout=30)
@@ -173,7 +170,6 @@ def _request_with_retry(session, url, params=None, max_attempts=10):
 
 
 def _fetch_market_by_id(session, market_id):
-    """Fetch a single market with tags. Returns market dict or None on 404/total failure."""
     url = f"{GAMMA_BASE}/markets/{market_id}"
     resp = _request_with_retry(session, url, params={"include_tag": "true"})
     if resp is None:
@@ -181,18 +177,13 @@ def _fetch_market_by_id(session, market_id):
     if resp.status_code == 404:
         return None
     if resp.status_code != 200:
-        print(
-            f"  Unexpected status {resp.status_code} for market {market_id}: {resp.text[:200]}"
-        )
         return None
     try:
         return resp.json()
-    except Exception as e:
-        print(f"  JSON parse failed for market {market_id}: {e}")
+    except Exception:
         return None
 
 
-# CSV header (kept in sync with _build_row and COL_* indices)
 HEADERS = [
     "createdAt",
     "id",
@@ -213,7 +204,6 @@ HEADERS = [
 
 
 def _phase1_keyset_fetch(csv_filename: str, batch_size: int):
-    """Phase 1: keyset-paginate /markets/keyset, write rows, resume via cursor sidecar."""
     base_url = f"{GAMMA_BASE}/markets/keyset"
 
     existing_lines = count_csv_lines(csv_filename)
@@ -224,10 +214,7 @@ def _phase1_keyset_fetch(csv_filename: str, batch_size: int):
         print(f"Phase 1: resuming from saved cursor ({existing_lines} existing rows)")
         mode = "a"
     elif file_exists and not after_cursor:
-        print(
-            f"Phase 1: file exists ({existing_lines} rows) but no cursor — "
-            f"skipping phase 1 (assume keyset pass complete)"
-        )
+        print(f"Phase 1: file exists ({existing_lines} rows), no cursor — skipping")
         return
     else:
         print(f"Phase 1: creating new CSV {csv_filename}")
@@ -235,6 +222,7 @@ def _phase1_keyset_fetch(csv_filename: str, batch_size: int):
 
     session = requests.Session()
     total_fetched = 0
+    empty_streak = 0  # consecutive empty / no-cursor responses
 
     with open(csv_filename, mode, newline="", encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
@@ -249,7 +237,7 @@ def _phase1_keyset_fetch(csv_filename: str, batch_size: int):
             print(f"  Fetching batch (cursor={after_cursor!r})...")
             resp = _request_with_retry(session, base_url, params=params)
             if resp is None:
-                print("  Giving up after repeated failures.")
+                print("  Giving up after repeated request failures.")
                 break
             if resp.status_code != 200:
                 print(f"  API error {resp.status_code}: {resp.text[:300]}")
@@ -266,10 +254,24 @@ def _phase1_keyset_fetch(csv_filename: str, batch_size: int):
             markets = payload.get("markets", [])
             next_cursor = payload.get("next_cursor")
 
+            # Empty results: could be transient. Retry up to EMPTY_RETRY_ATTEMPTS times
+            # before declaring really done. Don't clear cursor in between.
             if not markets:
-                print("  No markets returned. Done with phase 1.")
-                _clear_cursor(csv_filename)
-                break
+                empty_streak += 1
+                if empty_streak >= EMPTY_RETRY_ATTEMPTS:
+                    print(
+                        f"  {empty_streak} consecutive empty responses — confirmed end of data."
+                    )
+                    _clear_cursor(csv_filename)
+                    break
+                wait = 10 * empty_streak
+                print(
+                    f"  Empty markets array (streak {empty_streak}/{EMPTY_RETRY_ATTEMPTS}). Sleeping {wait}s and retrying same cursor."
+                )
+                time.sleep(wait)
+                continue
+
+            empty_streak = 0  # got real data, reset
 
             for market in markets:
                 try:
@@ -281,15 +283,25 @@ def _phase1_keyset_fetch(csv_filename: str, batch_size: int):
                     )
 
             csvfile.flush()
-            if next_cursor:
-                _save_cursor(csv_filename, next_cursor)
 
-            print(f"  +{len(markets)} markets (total new: {total_fetched})")
-
+            # No next_cursor: per spec, last page. Same retry-to-confirm logic.
             if not next_cursor:
-                print("  No next_cursor — reached end.")
-                _clear_cursor(csv_filename)
-                break
+                empty_streak += 1
+                if empty_streak >= EMPTY_RETRY_ATTEMPTS:
+                    print(
+                        f"  {empty_streak} consecutive responses without next_cursor — confirmed end."
+                    )
+                    _clear_cursor(csv_filename)
+                    break
+                wait = 10 * empty_streak
+                print(
+                    f"  No next_cursor returned (streak {empty_streak}/{EMPTY_RETRY_ATTEMPTS}). Sleeping {wait}s and retrying same cursor."
+                )
+                time.sleep(wait)
+                continue
+
+            _save_cursor(csv_filename, next_cursor)
+            print(f"  +{len(markets)} markets (total new: {total_fetched})")
             after_cursor = next_cursor
 
     session.close()
@@ -298,8 +310,6 @@ def _phase1_keyset_fetch(csv_filename: str, batch_size: int):
 
 def _phase2_repair(csv_filename: str, what: str):
     """
-    Phase 2/3: stream the CSV, identify rows needing repair, re-fetch by id, rewrite.
-
     what = "critical"  -> rows missing outcomes/clobTokenIds/closedTime
     what = "tags"      -> rows with empty tags column
     """
@@ -307,14 +317,13 @@ def _phase2_repair(csv_filename: str, what: str):
         print(f"  {csv_filename} not found, skipping.")
         return
 
-    # First pass: scan for rows that need repair, build set of row indices + ids
-    print(
-        f"Phase {'2' if what == 'critical' else '3'}: scanning for rows needing repair ({what})..."
-    )
-    to_repair = {}  # row_index -> market_id
+    phase_label = "2" if what == "critical" else "3"
+    print(f"Phase {phase_label}: scanning for rows needing repair ({what})...")
+
+    to_repair = {}
     with open(csv_filename, "r", encoding="utf-8") as f:
         reader = csv.reader(f)
-        header = next(reader, None)
+        next(reader, None)
         for idx, row in enumerate(reader):
             if not row:
                 continue
@@ -330,52 +339,71 @@ def _phase2_repair(csv_filename: str, what: str):
                         to_repair[idx] = mid
 
     if not to_repair:
-        print(f"  Nothing to repair for {what}. Skipping.")
+        print(f"  Nothing to repair for {what}.")
         return
 
-    print(f"  {len(to_repair):,} rows need repair. Fetching individually...")
+    print(
+        f"  {len(to_repair):,} rows need repair. Fetching with {REPAIR_WORKERS} workers..."
+    )
 
-    # Fetch all needed market objects
     session = requests.Session()
-    fixed_rows = {}  # row_index -> new row
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=REPAIR_WORKERS, pool_maxsize=REPAIR_WORKERS
+    )
+    session.mount("https://", adapter)
+
+    fixed_rows = {}
     bad_log = open(_bad_log_path(csv_filename), "a", encoding="utf-8")
-    repaired_count = 0
-    still_bad_count = 0
-    not_found_count = 0
+    counts = {"repaired": 0, "still_bad": 0, "not_found": 0, "done": 0}
+    lock = threading.Lock()
+
+    def fetch_one(idx_mid):
+        idx, mid = idx_mid
+        market = _fetch_market_by_id(session, mid)
+        return idx, mid, market
 
     try:
-        for n, (idx, mid) in enumerate(to_repair.items(), start=1):
-            market = _fetch_market_by_id(session, mid)
-            if market is None:
-                not_found_count += 1
-                bad_log.write(f"{mid}\tnot_found_or_failed\t{what}\n")
-                continue
-            new_row = _build_row(market)
-            fixed_rows[idx] = new_row
-
-            still_missing = (
-                _row_is_missing_critical(new_row) if what == "critical" else []
-            )
-            if still_missing or (what == "tags" and _is_blank(new_row[COL_TAGS])):
-                still_bad_count += 1
-                fields = ",".join(still_missing) if still_missing else "tags"
-                bad_log.write(f"{mid}\tstill_missing\t{fields}\n")
-            else:
-                repaired_count += 1
-
-            if n % 100 == 0:
-                print(
-                    f"    {n:,}/{len(to_repair):,} re-fetched (repaired: {repaired_count}, still bad: {still_bad_count}, 404: {not_found_count})"
-                )
+        with ThreadPoolExecutor(max_workers=REPAIR_WORKERS) as ex:
+            futures = [ex.submit(fetch_one, item) for item in to_repair.items()]
+            for fut in as_completed(futures):
+                idx, mid, market = fut.result()
+                with lock:
+                    counts["done"] += 1
+                    if market is None:
+                        counts["not_found"] += 1
+                        bad_log.write(f"{mid}\tnot_found_or_failed\t{what}\n")
+                    else:
+                        new_row = _build_row(market)
+                        fixed_rows[idx] = new_row
+                        still_missing = (
+                            _row_is_missing_critical(new_row)
+                            if what == "critical"
+                            else []
+                        )
+                        if still_missing or (
+                            what == "tags" and _is_blank(new_row[COL_TAGS])
+                        ):
+                            counts["still_bad"] += 1
+                            fields = (
+                                ",".join(still_missing) if still_missing else "tags"
+                            )
+                            bad_log.write(f"{mid}\tstill_missing\t{fields}\n")
+                        else:
+                            counts["repaired"] += 1
+                    if counts["done"] % 500 == 0:
+                        print(
+                            f"    {counts['done']:,}/{len(to_repair):,} done "
+                            f"(repaired: {counts['repaired']}, still bad: {counts['still_bad']}, 404: {counts['not_found']})"
+                        )
     finally:
         session.close()
         bad_log.close()
 
     print(
-        f"  Re-fetch done. Repaired: {repaired_count}, still bad: {still_bad_count}, not found/failed: {not_found_count}"
+        f"  Re-fetch done. Repaired: {counts['repaired']}, "
+        f"still bad: {counts['still_bad']}, not found/failed: {counts['not_found']}"
     )
 
-    # Rewrite CSV streaming, swapping in fixed rows
     print(f"  Rewriting {csv_filename} with repaired rows...")
     tmp_path = csv_filename + ".tmp"
     with open(csv_filename, "r", encoding="utf-8") as fin, open(
@@ -395,19 +423,7 @@ def _phase2_repair(csv_filename: str, what: str):
     print(f"  Rewrite complete.")
 
 
-def update_markets(csv_filename: str = "markets_v2.csv", batch_size: int = 500):
-    """
-    Three-pass market scrape:
-      Phase 1 — keyset paginate /markets/keyset, write rows.
-      Phase 2 — re-fetch any row missing outcomes/clobTokenIds/closedTime via /markets/{id}.
-      Phase 3 — re-fetch any row with empty tags via /markets/{id}?include_tag=true.
-
-    Resume:
-      - Phase 1 resumes from <csv>.cursor sidecar.
-      - Phases 2 & 3 are idempotent: they scan the CSV and repair what's still bad.
-
-    Bad rows that can't be repaired are appended to <csv>.bad_rows.log.
-    """
+def update_markets(csv_filename: str = "new_markets.csv", batch_size: int = 500):
     print("=" * 60)
     print(f"update_markets -> {csv_filename}")
     print("=" * 60)
@@ -421,5 +437,5 @@ def update_markets(csv_filename: str = "markets_v2.csv", batch_size: int = 500):
         print(f"  Bad log: {bp}")
 
 
-# if __name__ == "__main__":
-#     update_markets()
+if __name__ == "__main__":
+    update_markets()
