@@ -437,5 +437,5 @@ def update_markets(csv_filename: str = "new_markets.csv", batch_size: int = 500)
         print(f"  Bad log: {bp}")
 
 
-if __name__ == "__main__":
-    update_markets()
+# if __name__ == "__main__":
+#     update_markets()
