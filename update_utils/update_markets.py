@@ -20,7 +20,7 @@ def count_csv_lines(csv_filename: str) -> int:
         return 0
 
 
-def update_markets(csv_filename: str = "markets.csv", batch_size: int = 500):
+def update_markets(csv_filename: str = "marketsNew.csv", batch_size: int = 500):
     """
     Fetch markets ordered by creation date and save to CSV.
     Automatically resumes from the correct offset based on existing CSV lines.
@@ -46,6 +46,7 @@ def update_markets(csv_filename: str = "markets.csv", batch_size: int = 500):
         "condition_id",
         "volume",
         "ticker",
+        "resolved",
         "closedTime",
     ]
 
@@ -152,6 +153,15 @@ def update_markets(csv_filename: str = "markets.csv", batch_size: int = 500):
                         if market.get("events") and len(market.get("events", [])) > 0:
                             ticker = market["events"][0].get("ticker", "")
 
+                        # Resolved status + closedTime fallback to scheduled endDate
+                        actual_closed_time = market.get("closedTime", "")
+                        resolved = bool(actual_closed_time)
+                        closed_time_value = (
+                            actual_closed_time
+                            if resolved
+                            else market.get("endDate", "")
+                        )
+
                         row = [
                             market.get("createdAt", ""),
                             market.get("id", ""),
@@ -165,7 +175,8 @@ def update_markets(csv_filename: str = "markets.csv", batch_size: int = 500):
                             market.get("conditionId", ""),
                             market.get("volume", ""),
                             ticker,
-                            market.get("closedTime", ""),
+                            resolved,
+                            closed_time_value,
                         ]
 
                         writer.writerow(row)
