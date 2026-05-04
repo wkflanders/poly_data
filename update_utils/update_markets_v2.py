@@ -29,6 +29,10 @@ def _bad_log_path(csv_filename: str) -> str:
     return csv_filename + ".bad_rows.log"
 
 
+def _fixes_path(csv_filename: str, what: str) -> str:
+    return csv_filename + f".fixes.{what}.jsonl"
+
+
 def _is_blank(v) -> bool:
     return v is None or v == ""
 
@@ -66,9 +70,7 @@ def _build_row(market: dict) -> List:
     token1 = clob_tokens[0] if clob_tokens and len(clob_tokens) > 0 else ""
     token2 = clob_tokens[1] if clob_tokens and len(clob_tokens) > 1 else ""
 
-    neg_risk = market.get("negRiskAugmented", False) or market.get(
-        "negRiskOther", False
-    )
+    neg_risk = market.get("negRiskAugmented", False) or market.get("negRiskOther", False)
     question_text = market.get("question", "") or market.get("title", "") or ""
 
     ticker = ""
@@ -156,26 +158,13 @@ def _fetch_market_by_id(session, market_id):
 
 
 HEADERS = [
-    "createdAt",
-    "id",
-    "question",
-    "answer1",
-    "answer2",
-    "neg_risk",
-    "market_slug",
-    "token1",
-    "token2",
-    "condition_id",
-    "volume",
-    "ticker",
-    "resolved",
-    "closedTime",
-    "tags",
+    "createdAt", "id", "question", "answer1", "answer2", "neg_risk",
+    "market_slug", "token1", "token2", "condition_id", "volume",
+    "ticker", "resolved", "closedTime", "tags",
 ]
 
 
 def _phase1_subfetch(csv_filename: str, batch_size: int, closed_flag: bool):
-    """One sub-pass of phase 1: fetches either all open or all closed markets."""
     base_url = f"{GAMMA_BASE}/markets/keyset"
     label = "closed" if closed_flag else "open"
     cursor_file = csv_filename + f".cursor.{label}"
@@ -200,8 +189,6 @@ def _phase1_subfetch(csv_filename: str, batch_size: int, closed_flag: bool):
         writer = csv.writer(csvfile)
 
         while True:
-            # NOTE: don't pass `order=createdAt` — server 500s when combined with `closed=true`.
-            # Default sort (by id) is fine and gives full historical coverage.
             params = {"limit": batch_size, "closed": "true" if closed_flag else "false"}
             if after_cursor:
                 params["after_cursor"] = after_cursor
@@ -226,32 +213,25 @@ def _phase1_subfetch(csv_filename: str, batch_size: int, closed_flag: bool):
             markets = payload.get("markets", [])
             next_cursor = payload.get("next_cursor")
 
-            # Write whatever markets came back.
             for market in markets:
                 try:
                     writer.writerow(_build_row(market))
                     total_fetched += 1
                 except Exception as e:
-                    print(
-                        f"  [{label}] Error building row for market {market.get('id', '?')}: {e}"
-                    )
+                    print(f"  [{label}] Error building row for market {market.get('id', '?')}: {e}")
             csvfile.flush()
 
             if markets:
                 print(f"  [{label}] +{len(markets)} markets (total: {total_fetched})")
 
-            # No next_cursor = last page per spec. Done.
             if not next_cursor:
-                print(
-                    f"  [{label}] No next_cursor — reached end. Sub-pass total: {total_fetched}"
-                )
+                print(f"  [{label}] No next_cursor — reached end. Sub-pass total: {total_fetched}")
                 if os.path.isfile(cursor_file):
                     os.remove(cursor_file)
                 with open(done_marker, "w") as f:
                     f.write("done\n")
                 break
 
-            # Save cursor and advance.
             tmp = cursor_file + ".tmp"
             with open(tmp, "w") as f:
                 f.write(next_cursor)
@@ -262,29 +242,59 @@ def _phase1_subfetch(csv_filename: str, batch_size: int, closed_flag: bool):
 
 
 def _phase1_keyset_fetch(csv_filename: str, batch_size: int):
-    """Phase 1: fetch all markets via two sub-passes (open + closed)."""
     file_exists = os.path.exists(csv_filename) and count_csv_lines(csv_filename) > 0
-
     if not file_exists:
         print(f"Phase 1: creating new CSV {csv_filename}")
         with open(csv_filename, "w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(HEADERS)
-
     for closed_flag in (False, True):
         _phase1_subfetch(csv_filename, batch_size, closed_flag)
+
+
+def _load_existing_fixes(fixes_file: str):
+    """Load any previously-fetched fixes from the sidecar file. Returns dict row_idx -> row."""
+    fixes = {}
+    if not os.path.isfile(fixes_file):
+        return fixes
+    print(f"  Loading existing fixes from {fixes_file}...")
+    with open(fixes_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                fixes[obj["idx"]] = obj["row"]
+            except Exception:
+                continue
+    print(f"  Loaded {len(fixes):,} cached fixes.")
+    return fixes
 
 
 def _phase2_repair(csv_filename: str, what: str):
     """
     what = "critical"  -> rows missing outcomes/clobTokenIds/closedTime
     what = "tags"      -> rows with empty tags column
+
+    Strategy:
+      1. Scan CSV, find rows needing repair.
+      2. Fetch concurrently. Append each fix as JSON to a sidecar file as soon as it lands.
+      3. After all fetches complete, rewrite the CSV swapping in fixes from the sidecar.
+      4. Delete the sidecar.
+
+    Re-running after Ctrl+C: the sidecar is loaded and matching IDs are skipped from re-fetch.
     """
     if not os.path.isfile(csv_filename):
         print(f"  {csv_filename} not found, skipping.")
         return
 
     phase_label = "2" if what == "critical" else "3"
+    fixes_file = _fixes_path(csv_filename, what)
+
     print(f"Phase {phase_label}: scanning for rows needing repair ({what})...")
+
+    # Load any cached fixes from a previous interrupted run
+    cached_fixes = _load_existing_fixes(fixes_file)
 
     to_repair = {}
     with open(csv_filename, "r", encoding="utf-8") as f:
@@ -293,6 +303,8 @@ def _phase2_repair(csv_filename: str, what: str):
         for idx, row in enumerate(reader):
             if not row:
                 continue
+            if idx in cached_fixes:
+                continue  # already fetched in a prior run
             if what == "critical":
                 if _row_is_missing_critical(row):
                     mid = row[COL_ID]
@@ -304,13 +316,14 @@ def _phase2_repair(csv_filename: str, what: str):
                     if mid:
                         to_repair[idx] = mid
 
-    if not to_repair:
+    if not to_repair and not cached_fixes:
         print(f"  Nothing to repair for {what}.")
         return
 
-    print(
-        f"  {len(to_repair):,} rows need repair. Fetching with {REPAIR_WORKERS} workers..."
-    )
+    if to_repair:
+        print(f"  {len(to_repair):,} rows need repair ({len(cached_fixes):,} cached). Fetching with {REPAIR_WORKERS} workers...")
+    else:
+        print(f"  All {len(cached_fixes):,} fixes already cached, applying...")
 
     session = requests.Session()
     adapter = requests.adapters.HTTPAdapter(
@@ -318,8 +331,8 @@ def _phase2_repair(csv_filename: str, what: str):
     )
     session.mount("https://", adapter)
 
-    fixed_rows = {}
     bad_log = open(_bad_log_path(csv_filename), "a", encoding="utf-8")
+    sidecar = open(fixes_file, "a", encoding="utf-8")
     counts = {"repaired": 0, "still_bad": 0, "not_found": 0, "done": 0}
     lock = threading.Lock()
 
@@ -340,22 +353,19 @@ def _phase2_repair(csv_filename: str, what: str):
                         bad_log.write(f"{mid}\tnot_found_or_failed\t{what}\n")
                     else:
                         new_row = _build_row(market)
-                        fixed_rows[idx] = new_row
-                        still_missing = (
-                            _row_is_missing_critical(new_row)
-                            if what == "critical"
-                            else []
-                        )
-                        if still_missing or (
-                            what == "tags" and _is_blank(new_row[COL_TAGS])
-                        ):
+                        # Append to sidecar immediately — durable across Ctrl+C
+                        sidecar.write(json.dumps({"idx": idx, "row": new_row}) + "\n")
+                        sidecar.flush()
+                        cached_fixes[idx] = new_row
+
+                        still_missing = _row_is_missing_critical(new_row) if what == "critical" else []
+                        if still_missing or (what == "tags" and _is_blank(new_row[COL_TAGS])):
                             counts["still_bad"] += 1
-                            fields = (
-                                ",".join(still_missing) if still_missing else "tags"
-                            )
+                            fields = ",".join(still_missing) if still_missing else "tags"
                             bad_log.write(f"{mid}\tstill_missing\t{fields}\n")
                         else:
                             counts["repaired"] += 1
+
                     if counts["done"] % 500 == 0:
                         print(
                             f"    {counts['done']:,}/{len(to_repair):,} done "
@@ -364,29 +374,35 @@ def _phase2_repair(csv_filename: str, what: str):
     finally:
         session.close()
         bad_log.close()
+        sidecar.close()
 
-    print(
-        f"  Re-fetch done. Repaired: {counts['repaired']}, "
-        f"still bad: {counts['still_bad']}, not found/failed: {counts['not_found']}"
-    )
+    if to_repair:
+        print(
+            f"  Re-fetch done. Repaired: {counts['repaired']}, "
+            f"still bad: {counts['still_bad']}, not found/failed: {counts['not_found']}"
+        )
 
-    print(f"  Rewriting {csv_filename} with repaired rows...")
+    # Final flush: rewrite CSV swapping in all cached_fixes
+    print(f"  Applying {len(cached_fixes):,} fixes to {csv_filename}...")
     tmp_path = csv_filename + ".tmp"
-    with open(csv_filename, "r", encoding="utf-8") as fin, open(
-        tmp_path, "w", newline="", encoding="utf-8"
-    ) as fout:
+    with open(csv_filename, "r", encoding="utf-8") as fin, \
+         open(tmp_path, "w", newline="", encoding="utf-8") as fout:
         reader = csv.reader(fin)
         writer = csv.writer(fout)
         header = next(reader, None)
         if header:
             writer.writerow(header)
         for idx, row in enumerate(reader):
-            if idx in fixed_rows:
-                writer.writerow(fixed_rows[idx])
+            if idx in cached_fixes:
+                writer.writerow(cached_fixes[idx])
             else:
                 writer.writerow(row)
     os.replace(tmp_path, csv_filename)
     print(f"  Rewrite complete.")
+
+    # Cleanup sidecar — fixes are now in the CSV
+    if os.path.isfile(fixes_file):
+        os.remove(fixes_file)
 
 
 def update_markets(csv_filename: str = "new_markets.csv", batch_size: int = 500):

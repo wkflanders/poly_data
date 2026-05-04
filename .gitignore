@@ -1,8 +1,11 @@
+.tmp*
+tmp*
 markets.csv
 processed/
+trades_*
 goldsky/
 orderbook_snapshots
-orderbook_*/
+orderbook_*
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -214,3 +217,5 @@ __marimo__/
 .DS_Store
 digest.txt
 data/
+
+polydata.duckdb*

@@ -18,15 +18,21 @@ CLOB_BASE = "https://clob.polymarket.com"
 DATA_DIR = "orderbook_snapshots"
 PROGRESS_FILE = os.path.join(DATA_DIR, "progress.json")
 _active_progress_file = PROGRESS_FILE
-PAGE_SIZE = 1000
 
+PAGE_SIZE = 1000
 BIG_MARKET_THRESHOLD = 999999999
 CHUNKS_PER_BIG_MARKET = 8
-
 ZSTD_LEVEL = 3  # good balance of speed/ratio
 
 print_lock = threading.Lock()
 progress_lock = threading.Lock()
+
+# Graceful shutdown: signal handler sets a flag, workers check it and exit
+# cleanly between markets. The previous os._exit(0) handler killed Python in
+# the middle of f.write(), leaving partial zstd frames in .zst files —
+# which then made build_db.py blow up with JSONDecodeError on line 1.
+_shutdown_event = threading.Event()
+_force_quit_count = 0
 
 
 def tprint(*args, **kwargs):
@@ -35,8 +41,17 @@ def tprint(*args, **kwargs):
 
 
 def handle_shutdown(signum, frame):
-    tprint("\n⚠ Stopping. Progress saved, data safe. Re-run to continue.")
-    os._exit(0)
+    global _force_quit_count
+    _force_quit_count += 1
+    if _force_quit_count == 1:
+        _shutdown_event.set()
+        tprint(
+            "\n⚠ Shutdown requested — finishing in-flight writes. "
+            "Press Ctrl+C again to force quit (may corrupt files)."
+        )
+    else:
+        tprint("\n⚠ Force quit. Files may be corrupt.")
+        os._exit(1)
 
 
 signal.signal(signal.SIGINT, handle_shutdown)
@@ -156,64 +171,21 @@ def probe_market(session, asset_id, start_ts, market_id):
 
 
 def write_snapshots_zst(zst_path, snapshots):
-    """Append snapshots as a new zstd frame. Multi-frame zst files are valid."""
+    """Append snapshots as a new zstd frame. Multi-frame zst files are valid.
+
+    Note: any reader of these files MUST use stream_reader(read_across_frames=True).
+    The python-zstandard default of False silently truncates everything past the
+    first frame.
+    """
     cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL)
     data = "".join(json.dumps(snap, separators=(",", ":")) + "\n" for snap in snapshots)
     compressed = cctx.compress(data.encode("utf-8"))
     with open(zst_path, "ab") as f:
         f.write(compressed)
-
-
-def fetch_chunk(session, asset_id, start_ts, end_ts, market_id, chunk_file):
-    """Fetch a time range chunk. Writes compressed."""
-    total = 0
-    page = 0
-    cursor = start_ts
-    prev_cursor = None
-    written_hashes = set()
-
-    while True:
-        data = fetch_page(session, asset_id, cursor, market_id, end_ts=end_ts)
-        if data is None:
-            break
-
-        snapshots = data.get("data", [])
-        if not snapshots:
-            break
-
-        new_cursor = int(snapshots[-1]["timestamp"])
-
-        unique = []
-        for snap in snapshots:
-            h = snap["hash"]
-            if h not in written_hashes:
-                written_hashes.add(h)
-                unique.append(snap)
-
-        if not unique:
-            # No new data — if cursor isn't moving we're done
-            if new_cursor == cursor:
-                break
-            prev_cursor = cursor
-            cursor = new_cursor
-            if len(snapshots) < PAGE_SIZE:
-                break
-            continue
-
-        write_snapshots_zst(chunk_file, unique)
-        total += len(unique)
-        page += 1
-        prev_cursor = cursor
-        cursor = new_cursor
-
-        if len(snapshots) < PAGE_SIZE:
-            break
-
-    return (
-        total,
-        cursor,
-        written_hashes and max(written_hashes, key=lambda h: h) or None,
-    )
+        # Force the frame to disk so kill -9 / power loss can't leave a partial
+        # frame at the end of the file.
+        f.flush()
+        os.fsync(f.fileno())
 
 
 def fetch_chunk(session, asset_id, start_ts, end_ts, market_id, chunk_file):
@@ -224,16 +196,16 @@ def fetch_chunk(session, asset_id, start_ts, end_ts, market_id, chunk_file):
     last_hash = None
 
     while True:
+        if _shutdown_event.is_set():
+            break
         data = fetch_page(session, asset_id, cursor, market_id, end_ts=end_ts)
         if data is None:
             break
-
         snapshots = data.get("data", [])
         if not snapshots:
             break
 
         new_cursor = int(snapshots[-1]["timestamp"])
-
         unique = []
         for snap in snapshots:
             h = snap["hash"]
@@ -249,47 +221,95 @@ def fetch_chunk(session, asset_id, start_ts, end_ts, market_id, chunk_file):
         # If cursor didn't advance, we're stuck — stop
         if new_cursor == cursor:
             break
-
         cursor = new_cursor
-
         if len(snapshots) < PAGE_SIZE:
             break
 
     return total, cursor, last_hash
 
 
+def _validate_zst(path):
+    """Quick sanity check — try to decompress the start of the file.
+
+    Catches the common corruption mode of "first frame is truncated/garbage"
+    that comes from interrupted migrations or interrupted writes.
+    """
+    try:
+        with open(path, "rb") as f:
+            dctx = zstd.ZstdDecompressor()
+            with dctx.stream_reader(f, read_across_frames=True) as r:
+                r.read(4096)
+        return True
+    except Exception:
+        return False
+
+
 def get_out_path(market_id):
-    """Return the .jsonl.zst path. Auto-migrates legacy .jsonl and .jsonl.gz files."""
+    """Return the .jsonl.zst path. Auto-migrates legacy .jsonl and .jsonl.gz files.
+
+    Validates existing .zst files — if one is corrupt (e.g. partial migration
+    from a killed previous run), it is removed and re-migrated from .gz/.jsonl
+    if those still exist. Migrations write to a .tmp file and atomically rename
+    so an interruption can't leave behind a half-written .zst.
+    """
     zst_path = os.path.join(DATA_DIR, "data", f"{market_id}.jsonl.zst")
     gz_path = os.path.join(DATA_DIR, "data", f"{market_id}.jsonl.gz")
     legacy_path = os.path.join(DATA_DIR, "data", f"{market_id}.jsonl")
 
-    # Already zst — done
+    # Existing .zst — verify it's not corrupt
     if os.path.isfile(zst_path):
-        return zst_path
+        if _validate_zst(zst_path):
+            return zst_path
+        # Corrupt. If we have a source to re-migrate from, drop the bad file.
+        # Otherwise drop it and let the caller fetch from scratch.
+        if os.path.isfile(legacy_path) or os.path.isfile(gz_path):
+            tprint(f"    Market {market_id}: existing .zst is corrupt, will re-migrate")
+        else:
+            tprint(
+                f"    Market {market_id}: existing .zst is corrupt and no source "
+                f"available — will fetch from scratch (clear progress entry to retry)"
+            )
+        try:
+            os.remove(zst_path)
+        except FileNotFoundError:
+            pass
 
-    # Migrate .jsonl -> .zst
+    # Migrate .jsonl -> .zst (atomic via temp file)
     if os.path.isfile(legacy_path):
+        tmp = zst_path + ".tmp"
         try:
             cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL)
-            with open(legacy_path, "rb") as f_in, open(zst_path, "wb") as f_out:
+            with open(legacy_path, "rb") as f_in, open(tmp, "wb") as f_out:
                 cctx.copy_stream(f_in, f_out)
+                f_out.flush()
+                os.fsync(f_out.fileno())
+            os.replace(tmp, zst_path)
             os.remove(legacy_path)
             tprint(f"    Market {market_id}: migrated .jsonl -> .jsonl.zst")
         except Exception as e:
             tprint(f"    Market {market_id}: .jsonl migration failed: {e}")
+            if os.path.exists(tmp):
+                try: os.remove(tmp)
+                except FileNotFoundError: pass
             return legacy_path
 
-    # Migrate .gz -> .zst
+    # Migrate .gz -> .zst (atomic via temp file)
     if os.path.isfile(gz_path):
+        tmp = zst_path + ".tmp"
         try:
             cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL)
-            with gzip.open(gz_path, "rb") as f_in, open(zst_path, "wb") as f_out:
+            with gzip.open(gz_path, "rb") as f_in, open(tmp, "wb") as f_out:
                 cctx.copy_stream(f_in, f_out)
+                f_out.flush()
+                os.fsync(f_out.fileno())
+            os.replace(tmp, zst_path)
             os.remove(gz_path)
             tprint(f"    Market {market_id}: migrated .jsonl.gz -> .jsonl.zst")
         except Exception as e:
             tprint(f"    Market {market_id}: .gz migration failed: {e}")
+            if os.path.exists(tmp):
+                try: os.remove(tmp)
+                except FileNotFoundError: pass
             return gz_path
 
     return zst_path
@@ -312,7 +332,6 @@ def fetch_market_orderbook(session, market, progress):
 
     # Probe to get count
     count = probe_market(session, asset_id, start_ts, market_id)
-
     if count == 0:
         closed = is_closed(market)
         with progress_lock:
@@ -339,16 +358,16 @@ def fetch_market_orderbook(session, market, progress):
         last_written_hash = last_hash
 
         while True:
+            if _shutdown_event.is_set():
+                break
             data = fetch_page(session, asset_id, cursor, market_id)
             if data is None:
                 break
-
             snapshots = data.get("data", [])
             if not snapshots:
                 break
 
             new_cursor = int(snapshots[-1]["timestamp"])
-
             unique = []
             for snap in snapshots:
                 h = snap["hash"]
@@ -373,7 +392,6 @@ def fetch_market_orderbook(session, market, progress):
             # If cursor didn't advance, stop — fetching again would return the same data.
             if new_cursor == cursor:
                 break
-
             cursor = new_cursor
 
             if page % 5 == 0:
@@ -394,7 +412,6 @@ def fetch_market_orderbook(session, market, progress):
         end_ts = NOW_TS
         time_range = end_ts - start_ts
         num_chunks = CHUNKS_PER_BIG_MARKET
-
         chunk_ranges = []
         for i in range(num_chunks):
             c_start = start_ts + (i * time_range // num_chunks)
@@ -413,7 +430,6 @@ def fetch_market_orderbook(session, market, progress):
         )
 
         chunk_results = [None] * num_chunks
-
         with ThreadPoolExecutor(max_workers=num_chunks) as ex:
             futures = {}
             for i, (c_start, c_end) in enumerate(chunk_ranges):
@@ -441,28 +457,25 @@ def fetch_market_orderbook(session, market, progress):
         # Merge chunks in order (zst frames concatenate validly)
         final_ts = start_ts
         final_hash = last_hash
-
         for i in range(num_chunks):
             chunk_file = os.path.join(chunk_dir, f"chunk_{i}.jsonl.zst")
             if not os.path.isfile(chunk_file):
                 continue
-
             with open(chunk_file, "rb") as cf, open(out_file, "ab") as of:
                 while True:
                     block = cf.read(8 * 1024 * 1024)
                     if not block:
                         break
                     of.write(block)
-
+                of.flush()
+                os.fsync(of.fileno())
             if chunk_results[i]:
                 chunk_total, chunk_last_ts, chunk_last_hash = chunk_results[i]
                 total_new += chunk_total
                 if chunk_last_ts > final_ts:
                     final_ts = chunk_last_ts
                     final_hash = chunk_last_hash
-
             os.remove(chunk_file)
-
         try:
             os.rmdir(chunk_dir)
         except OSError:
@@ -493,15 +506,20 @@ def orderbook_worker(markets_chunk, worker_id, progress):
     tprint(f"  [Worker {worker_id}] Starting with {len(markets_chunk):,} markets...")
 
     for market in markets_chunk:
+        if _shutdown_event.is_set():
+            tprint(
+                f"  [Worker {worker_id}] Shutdown — stopping before market {market['id']}"
+            )
+            break
         new = fetch_market_orderbook(session, market, progress)
         total += new
         done += 1
-
         if new > 0:
             with_data += 1
             status = "CLOSED" if is_closed(market) else "ACTIVE"
             tprint(
-                f"  [Worker {worker_id}] ✓ Market {market['id']}: {new:,} snapshots [{status}] | {done}/{len(markets_chunk)} ({with_data} with data, {skipped} skipped)"
+                f"  [Worker {worker_id}] ✓ Market {market['id']}: {new:,} snapshots [{status}] | "
+                f"{done}/{len(markets_chunk)} ({with_data} with data, {skipped} skipped)"
             )
         else:
             skipped += 1
@@ -510,13 +528,15 @@ def orderbook_worker(markets_chunk, worker_id, progress):
                 rate = done / elapsed if elapsed > 0 else 0
                 eta_mins = (len(markets_chunk) - done) / rate / 60 if rate > 0 else 0
                 tprint(
-                    f"  [Worker {worker_id}] Progress: {done:,}/{len(markets_chunk):,} | {with_data} with data | {skipped} empty | {rate:.1f}/s | ETA: {eta_mins:.0f}min"
+                    f"  [Worker {worker_id}] Progress: {done:,}/{len(markets_chunk):,} | "
+                    f"{with_data} with data | {skipped} empty | {rate:.1f}/s | ETA: {eta_mins:.0f}min"
                 )
 
     elapsed = time.time() - start_time
     session.close()
     tprint(
-        f"  [Worker {worker_id}] Finished: {total:,} snapshots from {with_data} markets ({skipped} empty) in {elapsed / 60:.1f}min"
+        f"  [Worker {worker_id}] Finished: {total:,} snapshots from {with_data} markets "
+        f"({skipped} empty) in {elapsed / 60:.1f}min"
     )
     return total
 
@@ -579,7 +599,8 @@ def update_orderbook(
         flush=True,
     )
     print(
-        f"\nScraping with {num_workers} workers (Ctrl+C to stop safely)...", flush=True
+        f"\nScraping with {num_workers} workers (Ctrl+C to stop safely)...",
+        flush=True,
     )
 
     chunks = [[] for _ in range(num_workers)]
@@ -594,7 +615,6 @@ def update_orderbook(
                 continue
             future = executor.submit(orderbook_worker, chunk, i, progress)
             futures[future] = i
-
         for future in as_completed(futures):
             worker_id = futures[future]
             try:
@@ -604,7 +624,10 @@ def update_orderbook(
                 print(f"Worker {worker_id} failed: {e}")
 
     print(f"\n{'=' * 60}", flush=True)
-    print(f"✅ Done! Total new snapshots: {grand_total:,}", flush=True)
+    if _shutdown_event.is_set():
+        print(f"⚠ Stopped early. New snapshots: {grand_total:,}", flush=True)
+    else:
+        print(f"✅ Done! Total new snapshots: {grand_total:,}", flush=True)
     print(f"   Data: {DATA_DIR}/data/", flush=True)
     print(f"   Progress: {PROGRESS_FILE}", flush=True)
     print(f"{'=' * 60}", flush=True)
@@ -614,7 +637,6 @@ def migrate_gz_to_zst(num_workers=8):
     """Convert all .jsonl.gz files to .jsonl.zst. Parallelized."""
     data_dir = os.path.join(DATA_DIR, "data")
     gz_files = [f for f in os.listdir(data_dir) if f.endswith(".jsonl.gz")]
-
     if not gz_files:
         print("No .gz files to migrate.", flush=True)
         return
@@ -623,7 +645,6 @@ def migrate_gz_to_zst(num_workers=8):
         f"Migrating {len(gz_files):,} .gz files to .zst with {num_workers} workers...",
         flush=True,
     )
-
     saved = [0]
     converted = [0]
     errors = [0]
@@ -632,11 +653,15 @@ def migrate_gz_to_zst(num_workers=8):
     def convert(fname):
         gz_path = os.path.join(data_dir, fname)
         zst_path = os.path.join(data_dir, fname.replace(".jsonl.gz", ".jsonl.zst"))
+        tmp = zst_path + ".tmp"
         try:
             cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL)
             orig = os.path.getsize(gz_path)
-            with gzip.open(gz_path, "rb") as f_in, open(zst_path, "wb") as f_out:
+            with gzip.open(gz_path, "rb") as f_in, open(tmp, "wb") as f_out:
                 cctx.copy_stream(f_in, f_out)
+                f_out.flush()
+                os.fsync(f_out.fileno())
+            os.replace(tmp, zst_path)
             new_size = os.path.getsize(zst_path)
             os.remove(gz_path)
             with lock:
@@ -647,6 +672,9 @@ def migrate_gz_to_zst(num_workers=8):
                         f"  {converted[0]:,}/{len(gz_files):,} converted, saved {saved[0] / 1024**3:.1f} GB..."
                     )
         except Exception as e:
+            if os.path.exists(tmp):
+                try: os.remove(tmp)
+                except FileNotFoundError: pass
             with lock:
                 errors[0] += 1
                 if errors[0] <= 10:
@@ -654,7 +682,6 @@ def migrate_gz_to_zst(num_workers=8):
 
     with ThreadPoolExecutor(max_workers=num_workers) as ex:
         list(ex.map(convert, gz_files))
-
     print(
         f"Done. Converted {converted[0]:,} files, saved {saved[0] / 1024**3:.1f} GB, {errors[0]} errors",
         flush=True,
@@ -662,10 +689,9 @@ def migrate_gz_to_zst(num_workers=8):
 
 
 def migrate_gz_to_zst_from_dir(source_dir, num_workers=8):
-    """Convert .gz files from an external directory (e.g. /home/william/orderbook_gz) to .zst in data dir."""
+    """Convert .gz files from an external directory to .zst in data dir."""
     data_dir = os.path.join(DATA_DIR, "data")
     gz_files = [f for f in os.listdir(source_dir) if f.endswith(".jsonl.gz")]
-
     if not gz_files:
         print(f"No .gz files in {source_dir}.", flush=True)
         return
@@ -674,7 +700,6 @@ def migrate_gz_to_zst_from_dir(source_dir, num_workers=8):
         f"Migrating {len(gz_files):,} .gz files from {source_dir} to .zst in {data_dir}...",
         flush=True,
     )
-
     converted = [0]
     errors = [0]
     lock = threading.Lock()
@@ -687,16 +712,23 @@ def migrate_gz_to_zst_from_dir(source_dir, num_workers=8):
             with lock:
                 converted[0] += 1
             return
+        tmp = zst_path + ".tmp"
         try:
             cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL)
-            with gzip.open(gz_path, "rb") as f_in, open(zst_path, "wb") as f_out:
+            with gzip.open(gz_path, "rb") as f_in, open(tmp, "wb") as f_out:
                 cctx.copy_stream(f_in, f_out)
+                f_out.flush()
+                os.fsync(f_out.fileno())
+            os.replace(tmp, zst_path)
             os.remove(gz_path)
             with lock:
                 converted[0] += 1
                 if converted[0] % 500 == 0:
                     tprint(f"  {converted[0]:,}/{len(gz_files):,} converted...")
         except Exception as e:
+            if os.path.exists(tmp):
+                try: os.remove(tmp)
+                except FileNotFoundError: pass
             with lock:
                 errors[0] += 1
                 if errors[0] <= 10:
@@ -704,7 +736,6 @@ def migrate_gz_to_zst_from_dir(source_dir, num_workers=8):
 
     with ThreadPoolExecutor(max_workers=num_workers) as ex:
         list(ex.map(convert, gz_files))
-
     print(f"Done. Converted {converted[0]:,} files, {errors[0]} errors", flush=True)
 
 
@@ -713,7 +744,6 @@ def rebuild_progress():
     import subprocess
 
     data_dir = os.path.join(DATA_DIR, "data")
-
     progress = {}
     if os.path.isfile(PROGRESS_FILE):
         with open(PROGRESS_FILE) as f:
@@ -722,7 +752,6 @@ def rebuild_progress():
     known_markets = {
         v.get("market_id"): k for k, v in progress.items() if v.get("market_id")
     }
-
     files = os.listdir(data_dir) if os.path.isdir(data_dir) else []
     print(f"Data files on disk: {len(files):,}", flush=True)
     print(f"Already in progress: {len(progress):,}", flush=True)
@@ -744,7 +773,8 @@ def rebuild_progress():
             if fname.endswith(".zst"):
                 dctx = zstd.ZstdDecompressor()
                 with open(fpath, "rb") as f:
-                    reader = dctx.stream_reader(f)
+                    # CRITICAL: read_across_frames=True — files are multi-frame.
+                    reader = dctx.stream_reader(f, read_across_frames=True)
                     text = reader.read().decode("utf-8")
                     lines = text.strip().split("\n")
                     last_line = lines[-1] if lines else None
@@ -768,7 +798,6 @@ def rebuild_progress():
             snap = json.loads(last_line)
             asset_id = snap.get("asset_id", market_id)
             is_compressed = fname.endswith(".zst") or fname.endswith(".gz")
-
             progress[asset_id] = {
                 "last_ts": int(snap["timestamp"]),
                 "last_hash": snap.get("hash"),
